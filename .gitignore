@@ -83,3 +83,5 @@ serve_*.err
 mutate_*.py
 make_shortcut.py
 
+demo_screenshots/
+*.mp4
