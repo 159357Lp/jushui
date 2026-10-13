@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LM Loader - Model Manager</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #f5f5f5;
+    color: #333;
+    padding: 20px;
+  }
+  .container {
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 24px;
+    padding-bottom: 16px;
+    border-bottom: 2px solid #e0e0e0;
+  }
+  h1 {
+    font-size: 24px;
+    color: #1565c0;
+  }
+  .actions {
+    display: flex;
+    gap: 12px;
+  }
+  button {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 600;
+    transition: all 0.2s;
+  }
+  .btn-primary {
+    background: #1565c0;
+    color: white;
+  }
+  .btn-primary:hover {
+    background: #0d47a1;
+  }
+  .btn-success {
+    background: #2e7d32;
+    color: white;
+  }
+  .btn-success:hover {
+    background: #1b5e20;
+  }
+  .btn-danger {
+    background: #c62828;
+    color: white;
+  }
+  .btn-danger:hover {
+    background: #b71c1c;
+  }
+  .btn-secondary {
+    background: #757575;
+    color: white;
+  }
+  .btn-secondary:hover {
+    background: #616161;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: 20px;
+  }
+  .card {
+    background: white;
+    border-radius: 8px;
+    padding: 20px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  }
+  .card h2 {
+    font-size: 18px;
+    margin-bottom: 16px;
+    color: #424242;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  th, td {
+    padding: 12px;
+    text-align: left;
+    border-bottom: 1px solid #e0e0e0;
+  }
+  th {
+    background: #f5f5f5;
+    font-weight: 600;
+    font-size: 13px;
+    color: #616161;
+  }
+  td {
+    font-size: 14px;
+  }
+  .status-loaded {
+    color: #2e7d32;
+    font-weight: 600;
+  }
+  .status-unloaded {
+    color: #757575;
+  }
+  .engine-info {
+    padding: 12px;
+    background: #e8f5e9;
+    border-radius: 6px;
+    margin-bottom: 12px;
+  }
+  .engine-info .engine-name {
+    font-weight: 600;
+    color: #2e7d32;
+    font-size: 15px;
+  }
+  .engine-info .engine-detail {
+    color: #616161;
+    font-size: 13px;
+    margin-top: 4px;
+  }
+  .engine-error {
+    padding: 12px;
+    background: #ffebee;
+    border-radius: 6px;
+    color: #c62828;
+    font-weight: 600;
+  }
+  .loaded-model {
+    padding: 12px;
+    border: 1px solid #e0e0e0;
+    border-radius: 6px;
+    margin-bottom: 8px;
+  }
+  .loaded-model .model-name {
+    font-weight: 600;
+    color: #2e7d32;
+  }
+  .loaded-model .model-detail {
+    color: #757575;
+    font-size: 13px;
+    margin-top: 4px;
+  }
+  .modal {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0,0,0,0.5);
+    z-index: 1000;
+    justify-content: center;
+    align-items: center;
+  }
+  .modal.active {
+    display: flex;
+  }
+  .modal-content {
+    background: white;
+    padding: 24px;
+    border-radius: 8px;
+    max-width: 500px;
+    width: 90%;
+  }
+  .modal-content h3 {
+    margin-bottom: 16px;
+  }
+  .form-group {
+    margin-bottom: 16px;
+  }
+  .form-group label {
+    display: block;
+    margin-bottom: 6px;
+    font-weight: 600;
+    font-size: 14px;
+  }
+  .form-group input[type="checkbox"] {
+    margin-right: 8px;
+  }
+  .modal-actions {
+    display: flex;
+    gap: 12px;
+    justify-content: flex-end;
+    margin-top: 20px;
+  }
+  .loading {
+    text-align: center;
+    padding: 40px;
+    color: #757575;
+  }
+  .empty-state {
+    text-align: center;
+    padding: 40px;
+    color: #757575;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>LM Loader</h1>
+    <div class="actions">
+      <button class="btn-secondary" onclick="scanModels()">Scan Models</button>
+      <button class="btn-primary" onclick="refreshAll()">Refresh</button>
+    </div>
+  </header>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Models</h2>
+      <div id="models-container">
+        <div class="loading">Loading models...</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Engine</h2>
+      <div id="engine-container">
+        <div class="loading">Detecting engine...</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="load-modal" class="modal">
+  <div class="modal-content">
+    <h3>Load Model</h3>
+    <div class="form-group">
+      <label>Model</label>
+      <input type="text" id="modal-model-name" readonly style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;">
+    </div>
+    <div class="form-group">
+      <label>
+        <input type="checkbox" id="modal-keep"> Keep previous model loaded
+      </label>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn-success" onclick="confirmLoad()">Load</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API_BASE = window.location.origin;
+
+async function fetchJSON(url) {
+  const response = await fetch(url);
+  return response.json();
+}
+
+async function postJSON(url, data = {}) {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({ detail: response.statusText }));
+    throw new Error(err.detail || 'Request failed');
+  }
+  return response.json();
+}
+
+async function loadModels() {
+  try {
+    const data = await fetchJSON(`${API_BASE}/api/models`);
+    renderModels(data.models);
+  } catch (error) {
+    console.error('Failed to load models:', error);
+  }
+}
+
+async function loadEngine() {
+  try {
+    const data = await fetchJSON(`${API_BASE}/api/engine`);
+    renderEngine(data);
+  } catch (error) {
+    console.error('Failed to load engine:', error);
+    renderEngine(null);
+  }
+}
+
+function renderModels(models) {
+  const container = document.getElementById('models-container');
+
+  if (!models || models.length === 0) {
+    container.innerHTML = '<div class="empty-state">No models found. Click "Scan Models" to discover models.</div>';
+    return;
+  }
+
+  let html = `
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Architecture</th>
+          <th>Quantization</th>
+          <th>Parameters</th>
+          <th>Status</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+  `;
+
+  models.forEach(model => {
+    const sizeMB = (model.size / (1024 * 1024)).toFixed(0);
+    const statusClass = model.status === 'loaded' ? 'status-loaded' : 'status-unloaded';
+
+    html += `
+      <tr>
+        <td><strong>${model.name}</strong><br><small>${sizeMB}MB</small></td>
+        <td>${model.architecture}</td>
+        <td>${model.quantization}</td>
+        <td>${model.parameters}</td>
+        <td class="${statusClass}">${model.status}</td>
+        <td>
+          ${model.status === 'unloaded' ?
+            `<button class="btn-success" onclick="openLoadModal('${model.name.replace(/'/g, "\\'")}')">Load</button>` :
+            `<button class="btn-danger" onclick="unloadModel('${model.name.replace(/'/g, "\\'")}')">Unload</button>`
+          }
+        </td>
+      </tr>
+    `;
+  });
+
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}
+
+function renderEngine(data) {
+  const container = document.getElementById('engine-container');
+
+  if (!data || !data.engine) {
+    container.innerHTML = '<div class="engine-error">llama-server not found. Check engine.binary_path in config.yaml</div>';
+    return;
+  }
+
+  const eng = data.engine;
+  let html = `
+    <div class="engine-info">
+      <div class="engine-name">llama-server ${eng.version}</div>
+      <div class="engine-detail">${eng.binary_path}</div>
+      <div class="engine-detail">CUDA: ${eng.cuda_available ? 'Available' : 'Not found'}</div>
+    </div>
+  `;
+
+  const loaded = data.loaded_models || [];
+  if (loaded.length === 0) {
+    html += '<div class="empty-state" style="padding:16px;">No models loaded</div>';
+  } else {
+    loaded.forEach(item => {
+      html += `
+        <div class="loaded-model">
+          <div class="model-name">${item.model.name}</div>
+          <div class="model-detail">Port: ${item.port} | PID: ${item.pid}</div>
+          <div class="model-detail">URL: ${item.base_url}</div>
+        </div>
+      `;
+    });
+  }
+
+  container.innerHTML = html;
+}
+
+function openLoadModal(modelName) {
+  document.getElementById('modal-model-name').value = modelName;
+  document.getElementById('load-modal').classList.add('active');
+}
+
+function closeModal() {
+  document.getElementById('load-modal').classList.remove('active');
+}
+
+async function confirmLoad() {
+  const modelName = document.getElementById('modal-model-name').value;
+  const keepPrevious = document.getElementById('modal-keep').checked;
+
+  try {
+    await postJSON(`${API_BASE}/api/models/load`, {
+      model_name: modelName,
+      keep_previous: keepPrevious,
+    });
+    closeModal();
+    refreshAll();
+  } catch (error) {
+    alert('Failed to load model: ' + error.message);
+  }
+}
+
+async function unloadModel(modelName) {
+  if (!confirm(`Unload ${modelName}?`)) return;
+
+  try {
+    await fetch(`${API_BASE}/api/models/unload?model_name=${encodeURIComponent(modelName)}`, { method: 'POST' });
+    refreshAll();
+  } catch (error) {
+    alert('Failed to unload model: ' + error.message);
+  }
+}
+
+async function scanModels() {
+  try {
+    await postJSON(`${API_BASE}/api/models/scan`);
+    refreshAll();
+  } catch (error) {
+    alert('Failed to scan models: ' + error.message);
+  }
+}
+
+async function refreshAll() {
+  await Promise.all([loadModels(), loadEngine()]);
+}
+
+window.onload = refreshAll;
+</script>
+</body>
+</html>

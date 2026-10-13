@@ -1,0 +1,15 @@
+# Windows launchers must keep CRLF endings.
+#
+# Without this, git checks .bat files out with LF on a fresh clone (or after a
+# core.autocrlf change), and cmd.exe can mis-parse the `rem` header block and
+# swallow the command that follows it. The CRLF normalisation in
+# 启动GUI.bat is therefore not durable unless it is pinned here.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Python and Markdown track the repo's actual line endings (CRLF on this
+# Windows desktop tool). Pinning eol=lf here while the working tree is CRLF
+# makes git warn on every commit ("CRLF will be replaced by LF"), so we match
+# reality instead. A future mass renormalise to LF would let this switch back.
+*.py text eol=crlf
+*.md text eol=crlf

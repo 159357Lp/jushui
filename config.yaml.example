@@ -1,0 +1,91 @@
+# LM Loader Configuration
+# Copy this file to config.yaml and adjust as needed.
+
+# Model directories to scan for GGUF files
+model_dirs:
+  - ./models
+
+# Engine registry — llama-server binaries for different model types
+# Leave binary_path empty to use the bundled engine, or run the GUI's
+# "一键更新" button on the Settings page to download the latest build.
+engines:
+  # Primary engine: handles standard GGUF quantizations (Q4_K_M, Q8_0, etc.)
+  primary:
+    binary_path: ""
+    defaults:
+      n_gpu_layers: 999
+      ctx_size: 65536
+      cache_type_k: q4_0
+      cache_type_v: q4_0
+      flash_attn: true
+      parallel: 1
+      threads: 8
+      host: 127.0.0.1
+      startup_timeout: 120
+
+  # Ternary engine: handles Bonsai/BitNet ternary models (PQ2_0_TERNARY, TL2_TERNARY, etc.)
+  ternary:
+    binary_path: ""
+    defaults:
+      n_gpu_layers: 999
+      ctx_size: 32768
+      cache_type_k: q4_0
+      cache_type_v: q4_0
+      flash_attn: true
+      threads: 8
+      host: 127.0.0.1
+      startup_timeout: 120
+
+# CUDA toolkit path (optional, added to PATH for GPU acceleration).
+# Leave empty to auto-detect; the updater will bundle cudart DLLs if missing.
+cuda_path: ""
+
+# Port range for llama-server instances (auto-allocates free ports)
+port_range:
+  start: 8100
+  end: 8200
+
+# Download configuration
+download:
+  hf_mirror: https://hf-mirror.com
+  chunk_size: 10485760  # 10MB
+  max_retries: 3
+  timeout: 300
+
+# Model routing behavior
+router:
+  idle_unload_minutes: 30
+  max_concurrent_models: 1
+  auto_unload_on_switch: true
+
+# API server
+server:
+  host: 127.0.0.1
+  port: 8900
+  # Bearer token for every /api, /v1 and /api/shutdown request.
+  # Leave empty for a loopback-only install (default) — the API is then
+  # reachable by anything running as your user.
+  # SET THIS BEFORE changing host to anything other than 127.0.0.1: without a
+  # token, anyone who can reach the port can load or delete models, register
+  # an arbitrary executable as an engine, and shut the server down.
+  # Generate one with:  python -c "import os;print(os.urandom(24).hex())"
+  api_token: ""
+  # Deliberately serve on a non-loopback host with no token. Off by default;
+  # only turn it on if you understand the exposure.
+  allow_unauthenticated_network: false
+  # Extra browser origins allowed to call the API. The bundled web UI is
+  # same-origin, so this stays empty unless you host a separate frontend.
+  cors_origins: []
+
+# Extra directories a custom engine binary may live in (engine paths outside
+# <project>/engines must appear here or POST /api/engine/custom rejects them).
+engine_scan_dirs: []
+
+# Database
+database:
+  path: ./lmloader.db
+
+# Logging
+logging:
+  level: INFO
+  file: ./lmloader.log

@@ -1,0 +1,85 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Miscellaneous
+*.bak
+*.tmp
+
+# Model weights — multi-GB GGUF blobs, never version these
+models/
+*.gguf
+*.bin
+*.safetensors
+
+# Engine binaries (kept outside repo root, listed defensively)
+engines/
+*.dll
+*.exe
+
+# Local config (contains personal paths)
+config.yaml
+config.yaml.bak*
+
+# Database backups
+*.db.bak*
+
+# Test/probe artifacts
+probe_*.py
+probe_*.json
+serve_*.out
+serve_*.err
+
+# Developer-only mutation/audit scripts (contain local paths)
+mutate_*.py
+make_shortcut.py
+
