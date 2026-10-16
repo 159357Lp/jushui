@@ -17,7 +17,7 @@ from lmloader.infra.database import db
 from lmloader.infra.scanner import scanner
 from lmloader.engine.registry import engine_registry
 
-app = typer.Typer(help="LM Loader CLI - Manage local AI models")
+app = typer.Typer(help="掬水 CLI - Manage local AI models")
 console = Console(width=140)
 
 
@@ -37,7 +37,7 @@ async def _server_alive() -> bool:
 def _require_server():
     async def _check():
         if not await _server_alive():
-            console.print("[red][FAIL][/red] LM Loader server is not running.")
+            console.print("[red][FAIL][/red] 掬水 server is not running.")
             console.print("Start it first with: [bold]lmloader serve[/bold]")
             raise typer.Exit(1)
     asyncio.run(_check())
@@ -375,7 +375,7 @@ def ps():
 
 @app.command()
 def stop():
-    """Stop the LM Loader server gracefully."""
+    """Stop the 掬水 server gracefully."""
     async def _stop():
         if not await _server_alive():
             console.print("[yellow]Server is not running[/yellow]")
@@ -394,7 +394,7 @@ def stop():
 
 @app.command()
 def serve():
-    """Start the LM Loader server."""
+    """Start the 掬水 server."""
     import uvicorn
     from lmloader.infra.engine_store import ensure_engines
 

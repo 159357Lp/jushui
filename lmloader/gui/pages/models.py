@@ -775,9 +775,19 @@ class ModelsPage(QWidget):
 
         if "fmt" not in hidden:
             fmt_w = column_width("fmt", mode)
-            fmt_lbl = QLabel("Ollama" if model.get("backend") == "ollama" else "GGUF")
+            if model.get("backend") == "ollama":
+                fmt_text = "Ollama"
+            elif model.get("is_decision_model"):
+                fmt_text = tr("models.fmt_decision")
+            else:
+                # HF directories were shown as "GGUF" too; the scan already
+                # knows which one it is.
+                fmt_text = (model.get("metadata") or {}).get("format") or "GGUF"
+            fmt_lbl = QLabel(fmt_text)
             fmt_lbl.setFixedWidth(fmt_w)
             fmt_lbl.setStyleSheet(f"color: {c('muted')}; font-size: 12px;")
+            if model.get("is_decision_model"):
+                fmt_lbl.setToolTip(tr("models.decision_tip"))
             lay.addWidget(fmt_lbl, 0, Qt.AlignVCenter)
 
         size_w = column_width("size", mode)
@@ -822,7 +832,19 @@ class ModelsPage(QWidget):
 
         # ---- eye (vision toggle; fixed slot, placeholder when no vision) --
         eye_slot_w = column_width("eye", mode)
-        if has_vision:
+        if model.get("is_decision_model"):
+            # Its vision tower ships inside the weights, so there is no encoder
+            # to mount or unmount: this is a read-only capability mark, not a
+            # toggle, and clicking it must not try to reload the model.
+            mods = "/".join(model.get("modalities") or ["text"])
+            mark = QLabel()
+            mark.setFixedSize(eye_slot_w, 32)
+            mark.setAlignment(Qt.AlignCenter)
+            mark.setPixmap(eye_icon(c("green") if has_vision else c("muted"),
+                                    slashed=not has_vision, size=18).pixmap(18, 18))
+            mark.setToolTip(tr("models.decision_vision_tip").format(mods=mods))
+            lay.addWidget(mark, 0, Qt.AlignVCenter)
+        elif has_vision:
             eye = QPushButton()
             eye.setFixedSize(eye_slot_w, 32)
             eye.setIconSize(eye.size() - QSize(10, 10))

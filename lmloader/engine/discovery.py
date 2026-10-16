@@ -147,3 +147,13 @@ def find_engine_for_format(ext: str, discovered: list[dict] | None = None) -> di
         if ext in [f.lower() for f in eng.get("formats", [])]:
             return eng
     return None
+
+
+def find_engine_by_kind(kind: str, discovered: list[dict] | None = None) -> dict | None:
+    """Pick an engine of the given kind (used for directory-based models, e.g.
+    a HuggingFace model directory that vLLM takes with no file extension)."""
+    discovered = discovered if discovered is not None else discover_engines()
+    for eng in discovered:
+        if eng.get("kind") == kind:
+            return eng
+    return None

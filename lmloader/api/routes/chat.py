@@ -10,7 +10,7 @@ import json
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from lmloader.engine.lifecycle import lifecycle
 from lmloader.infra.events import event_log
@@ -84,10 +84,51 @@ async def _stream(url: str, body: dict):
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
+async def _refuse_decision_model(model_name: str, upstream_path: str) -> None:
+    """Reject chat-style endpoints for decision models, before loading them.
+
+    A decision model has no chat template: its vocabulary is the answer tokens,
+    so sampling it through /v1/chat/completions streams letter soup ("AAHHBBFF
+    ...") instead of an error, and it keeps burning the whole context as one
+    non-causal batch while doing so. Both shapes are refused here — a Decision
+    3.0 package and a GGUF carrying ``<arch>.decision.type`` — and the check
+    runs off the stored metadata so the model is never even started for a
+    request it can only answer with garbage.
+    """
+    from lmloader.engine.router import router as engine_router
+    from lmloader.infra.database import db
+
+    record = await db.get_model_by_name(model_name)
+    if record is None:
+        return  # an alias we cannot resolve here; let the loader decide
+    decision_type = str((record.metadata or {}).get("decision_type") or "")
+    if not decision_type and not engine_router.is_d3_package(record):
+        return
+    label = f"Decision 3.0 决策模型（{decision_type}）" if decision_type else "Decision 3.0 决策模型"
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"'{model_name}' 是{label}，不是聊天模型，不支持 {upstream_path}；"
+            "请改用 POST /v1/systemone（state 情境 + questions 问题集 → 每个选项的概率）"
+        ),
+    )
+
+
 async def _passthrough(request: Request, upstream_path: str, kind: str):
     body = await _read_body(request)
     model_name = body["model"]
+    await _refuse_decision_model(model_name, upstream_path)
     instance = await _ensure_instance(model_name)
+    if instance.launch_config.kind == "d3":
+        # Reached only when the request named the model by something other than
+        # its DB name, so the metadata check above could not identify it.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"'{model_name}' 是 Decision 3.0 决策模型，不支持 {upstream_path}；"
+                "请改用 POST /v1/systemone（questions 问题集 → 每个选项的概率）"
+            ),
+        )
     # Any real request resets the idle-unload timer for this model.
     instance.touch_activity()
 
@@ -143,6 +184,57 @@ async def create_responses(request: Request):
     return await _passthrough(request, "/v1/responses", "responses")
 
 
+@router.post("/systemone")
+async def create_system_one(request: Request):
+    """Decision 3.0 passthrough — the body is forwarded to d3_server verbatim.
+
+    ``{"model", "state", "questions", "images", "videos"}`` in, the model's
+    System One reply (``{"model", "answers", "usage"}``) out. Nothing is
+    translated or invented here: d3 has no chat API and faking one would hide
+    that it is a router/decision model.
+    """
+    body = await _read_body(request)
+    model_name = body["model"]
+    instance = await _ensure_instance(model_name)
+    # Two shapes of decision model reach this endpoint: a Decision 3.0 package
+    # (Python d3_server, kind "d3") and a decision-type GGUF served by a
+    # llama.cpp build that has /v1/systemone. Both take the body verbatim;
+    # anything else (an ordinary chat GGUF) genuinely has no such endpoint, so
+    # it is refused instead of being forwarded into a 404.
+    from lmloader.infra.database import db
+
+    record = await db.get_model_by_name(model_name)
+    is_decision_gguf = bool((record.metadata or {}).get("decision_type"))
+    if instance.launch_config.kind != "d3" and not is_decision_gguf:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{model_name}' 不是决策模型（引擎 {instance.launch_config.kind}），无 /v1/systemone",
+        )
+    instance.touch_activity()
+    n_q = len(body.get("questions") or {})
+    event_log.info(
+        "lifecycle",
+        f"[{model_name}] Running System One decision on {n_q} question(s)"
+        f"{', with media' if body.get('images') or body.get('videos') else ''}.",
+    )
+    response = await lifecycle.proxy_request(
+        model_name, "POST", "/v1/systemone", json_data=body, timeout=600.0
+    )
+    if not response:
+        raise HTTPException(status_code=502, detail="d3 server request failed")
+    # d3 reports bad requests as 422 {"detail": ...}; keep its verdict intact.
+    # Raising HTTPException with that dict would nest a second "detail" around
+    # it, so the upstream status and body are returned verbatim instead.
+    if response.status_code != 200:
+        try:
+            return JSONResponse(status_code=response.status_code,
+                                content=response.json())
+        except Exception:
+            return JSONResponse(status_code=response.status_code,
+                                content={"detail": response.text})
+    return response.json()
+
+
 @router.get("/models")
 async def list_models():
     from lmloader.infra.database import db
@@ -171,6 +263,7 @@ async def list_models():
                             "port": loaded_map[m.name]["port"],
                             "pid": loaded_map[m.name]["pid"],
                             "engine_slot": loaded_map[m.name].get("engine_slot", "primary"),
+                            "engine_kind": loaded_map[m.name].get("engine_kind", "llama"),
                         }
                         if m.name in loaded_map
                         else {}

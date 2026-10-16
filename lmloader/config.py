@@ -95,6 +95,17 @@ class RouterConfig(BaseModel):
     auto_unload_on_switch: bool = True
 
 
+class VllmConfig(BaseModel):
+    # Fraction of total GPU memory vLLM is allowed to reserve at startup for
+    # weights + KV cache. The upstream/Windows-fork default is 0.90–0.92, which
+    # grabs nearly all VRAM on a laptop (the Windows desktop/display and any
+    # co-resident engine are left with almost nothing). 0.85 keeps a safe
+    # headroom margin; raise it (toward 0.9) on a dedicated serving box.
+    gpu_memory_utilization: float = 0.85
+    # Cap per-request context; None = use the model's built-in max.
+    max_model_len: Optional[int] = None
+
+
 class ServerConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8900
@@ -131,6 +142,7 @@ class AppConfig(BaseModel):
     port_range: PortRangeConfig = PortRangeConfig()
     download: DownloadConfig = DownloadConfig()
     router: RouterConfig = RouterConfig()
+    vllm: VllmConfig = VllmConfig()
     server: ServerConfig = ServerConfig()
     database: DatabaseConfig = DatabaseConfig()
     logging: LoggingConfig = LoggingConfig()
@@ -205,6 +217,10 @@ class Settings:
     @property
     def router(self) -> RouterConfig:
         return self._config.router
+
+    @property
+    def vllm(self) -> VllmConfig:
+        return self._config.vllm
 
     @property
     def server(self) -> ServerConfig:

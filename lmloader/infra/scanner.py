@@ -1,5 +1,6 @@
 """Model scanner — discover GGUF/GGML and other single-file model formats."""
 
+import asyncio
 import os
 from pathlib import Path
 from typing import Optional
@@ -12,6 +13,14 @@ from lmloader.logger import logger
 
 # Single-file formats we register (beyond .gguf which gets full GGUF parsing)
 OTHER_EXTS = (".ggml", ".bin", ".onnx", ".engine")
+
+# Metadata key holding the file fingerprint. A record whose fingerprint still
+# matches the file on disk is reused without re-parsing the GGUF header.
+FP_KEY = "_fp"
+
+
+def _fingerprint(stat_result: os.stat_result) -> str:
+    return f"{stat_result.st_size}:{stat_result.st_mtime_ns}"
 
 
 class ModelScanner:
@@ -42,7 +51,7 @@ class ModelScanner:
         from lmloader.infra.ollama_lib import scan_ollama_models
 
         models: list[ModelRecord] = []
-        for item in scan_ollama_models():
+        for item in await asyncio.to_thread(scan_ollama_models):
             new_meta = dict(item.get("metadata") or {})
             if item.get("projector_path"):
                 new_meta["ollama_projector"] = item["projector_path"]
@@ -81,7 +90,23 @@ class ModelScanner:
         """Recursively scan directory for model files."""
         models = []
 
-        for root, dirs, files in os.walk(directory):
+        # The walk is blocking disk IO: collect it in a worker thread so the
+        # event loop stays responsive while a scan is running.
+        walked = await asyncio.to_thread(
+            lambda: [(root, files) for root, _dirs, files in os.walk(directory)]
+        )
+        for root, files in walked:
+            lower_files = [f.lower() for f in files]
+
+            # HuggingFace model directory: config.json + safetensors weights.
+            # Register the DIRECTORY once (for vLLM) rather than each shard.
+            if "config.json" in lower_files and any(
+                f.endswith(".safetensors") for f in lower_files
+            ):
+                model = await self._process_hf_dir(Path(root))
+                if model:
+                    models.append(model)
+
             for file in files:
                 lower = file.lower()
                 file_path = Path(root) / file
@@ -96,20 +121,93 @@ class ModelScanner:
 
         return models
 
+    async def _process_hf_dir(self, dir_path: Path) -> Optional[ModelRecord]:
+        """Register a HuggingFace model directory as one model (for vLLM).
+
+        The record's path is the directory; vLLM is routed via the hf_model
+        metadata marker. Total size sums every safetensors shard, and
+        config.json supplies model_type (architecture) / context length.
+        """
+        import json
+
+        size = 0
+        try:
+            for f in dir_path.glob("*.safetensors"):
+                if f.is_file():
+                    size += f.stat().st_size
+        except OSError:
+            pass
+
+        arch = "HF"
+        ctx = 0
+        try:
+            cfg = json.loads((dir_path / "config.json").read_text(encoding="utf-8"))
+            arch = str(cfg.get("model_type") or "HF")
+            ctx = int(cfg.get("max_position_embeddings") or 0)
+        except Exception:  # noqa: BLE001
+            pass
+
+        metadata: dict = {"format": "HF", "hf_model": True}
+        if ctx:
+            metadata["context_length"] = ctx
+
+        existing = await db.get_model_by_name(dir_path.name)
+        if existing:
+            await db.update_model_info(
+                existing.id, size, arch, "safetensors", existing.parameters, metadata
+            )
+            existing.size = size
+            existing.architecture = arch
+            existing.quantization = "safetensors"
+            existing.metadata = metadata
+            return existing
+
+        model = ModelRecord(
+            id=0,
+            name=dir_path.name,
+            path=str(dir_path),
+            size=size,
+            architecture=arch,
+            quantization="safetensors",
+            parameters="-",
+            metadata=metadata,
+            status="unloaded",
+        )
+        await db.add_model(model)
+        logger.info(f"Registered HuggingFace model directory: {dir_path.name}")
+        return model
+
     async def _process_gguf(self, file_path: Path) -> Optional[ModelRecord]:
-        """Process a single GGUF file."""
-        metadata = parse_gguf(str(file_path))
+        """Process a single GGUF file.
+
+        Parsing a GGUF header takes seconds, so a file whose size+mtime
+        fingerprint already matches the registered record is reused as-is
+        instead of being parsed again.
+        """
+        try:
+            stat_result = file_path.stat()
+        except OSError:
+            return None
+        fingerprint = _fingerprint(stat_result)
+
+        existing = await db.get_model_by_name(file_path.name)
+        if existing and (existing.metadata or {}).get(FP_KEY) == fingerprint:
+            logger.debug(f"Unchanged since last scan, skipped parse: {file_path.name}")
+            return existing
+
+        metadata = await asyncio.to_thread(parse_gguf, str(file_path))
         if not metadata:
             return None
 
-        existing = await db.get_model_by_name(file_path.name)
+        new_meta = metadata.to_dict()
+        new_meta[FP_KEY] = fingerprint
         if existing:
             # rescan: refresh parsed metadata (parser may have gained fields)
             await db.update_model_info(
-                existing.id, file_path.stat().st_size, metadata.architecture,
-                metadata.quantization, metadata.parameters, metadata.to_dict(),
+                existing.id, stat_result.st_size, metadata.architecture,
+                metadata.quantization, metadata.parameters, new_meta,
             )
-            existing.metadata = metadata.to_dict()
+            existing.metadata = new_meta
             logger.debug(f"Refreshed metadata for: {file_path.name}")
             return existing
 
@@ -117,11 +215,11 @@ class ModelScanner:
             id=0,
             name=file_path.name,
             path=str(file_path),
-            size=file_path.stat().st_size,
+            size=stat_result.st_size,
             architecture=metadata.architecture,
             quantization=metadata.quantization,
             parameters=metadata.parameters,
-            metadata=metadata.to_dict(),
+            metadata=new_meta,
             status="unloaded",
         )
 

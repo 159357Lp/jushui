@@ -81,6 +81,7 @@ class GGUFMetadata:
         block_count: int,
         supports_mtp: bool,
         raw_metadata: dict,
+        decision_type: str = "",
     ):
         self.architecture = architecture
         self.quantization = quantization
@@ -93,6 +94,7 @@ class GGUFMetadata:
         self.attention_head_count = attention_head_count
         self.block_count = block_count
         self.supports_mtp = supports_mtp
+        self.decision_type = decision_type
         self.raw_metadata = raw_metadata
 
     def to_dict(self) -> dict:
@@ -108,6 +110,7 @@ class GGUFMetadata:
             "attention_head_count": self.attention_head_count,
             "block_count": self.block_count,
             "supports_mtp": self.supports_mtp,
+            "decision_type": self.decision_type,
         }
 
 
@@ -176,6 +179,9 @@ def parse_gguf(file_path: str, force: bool = False) -> Optional[GGUFMetadata]:
             block_count=block_count,
             supports_mtp=supports_mtp,
             raw_metadata=raw_metadata,
+            decision_type=_get_string(reader, f"{architecture}.decision.type")
+            or next((v for k, v in raw_metadata.items()
+                     if k.endswith(".decision.type")), ""),
         )
 
         logger.info(f"Parsed GGUF: {path.name} - {architecture} {quantization} {parameters}")

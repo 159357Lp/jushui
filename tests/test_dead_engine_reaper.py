@@ -69,6 +69,7 @@ class FakeLaunch:
         self.port = port
         self.host = "127.0.0.1"
         self.engine_slot = "primary"
+        self.kind = "llama"
         self.args = ["-c", "32768"]
         self.mmproj_path = None
         self.model_path = "C:/tmp/probe.gguf"

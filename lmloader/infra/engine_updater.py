@@ -27,10 +27,11 @@ from pathlib import Path
 import httpx
 import yaml
 
+from lmloader import __version__
 from lmloader.infra.engine_store import bundled_binary, engine_dir
 from lmloader.infra.proc_util import no_window_kwargs
 
-UA = {"User-Agent": "LM-Loader/0.2.0 (engine updater)"}
+UA = {"User-Agent": f"LM-Loader/{__version__} (engine updater)"}
 
 _BUILD_RE = re.compile(r"build[:=\s]+(\d+)", re.IGNORECASE)
 _TAG_NUM_RE = re.compile(r"(\d+)")

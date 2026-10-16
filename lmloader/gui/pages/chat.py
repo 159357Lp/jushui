@@ -202,6 +202,14 @@ class ChatPage(QWidget):
         self._stats_final_pending = False
         self._db_ready = False
         self._deleting_conversations: set[int] = set()
+        # Loaded models whose engine is a Decision 3.0 package: they answer
+        # /v1/systemone questions, not chat completions.
+        self._decision_models: set[str] = set()
+        # Model dropdown state: name -> loaded, plus guards so repopulating or
+        # restoring a conversation never retriggers an auto-load.
+        self._model_loaded_map: dict[str, bool] = {}
+        self._programmatic_change = False
+        self._model_switching = False
         self._message_rows: list[QWidget] = []
         self._rendered_conv: dict | None = None
         self._attachments: list[dict] = []   # {"name", "path", "text"}
@@ -346,18 +354,6 @@ class ChatPage(QWidget):
         self._set_chat_title(tr("chat.new_chat_title"))
         top_bar.addWidget(self.chat_title)
         top_bar.addStretch()
-
-        self.model_combo = QComboBox()
-        self.model_combo.setMinimumWidth(220)
-        self.model_combo.setToolTip(tr("chat.select_loaded"))
-        self.model_combo.setMaximumWidth(280)
-        top_bar.addWidget(QLabel(tr("chat.model")))
-        top_bar.addWidget(self.model_combo)
-
-        refresh_btn = QPushButton(tr("chat.refresh"))
-        refresh_btn.clicked.connect(self._load_models)
-        refresh_btn.setCursor(Qt.PointingHandCursor)
-        top_bar.addWidget(refresh_btn)
         layout.addLayout(top_bar)
 
         self.chat_scroll = QScrollArea()
@@ -395,6 +391,26 @@ class ChatPage(QWidget):
         toolbar.setContentsMargins(0, 0, 0, 0)
         toolbar.setSpacing(8)
         self._thinking_on = True
+
+        # Model switcher sits right above the input so you can change model
+        # mid-chat. It lists every model; picking an unloaded one loads it.
+        self.model_combo = QComboBox()
+        self.model_combo.setObjectName("chatModelCombo")
+        self.model_combo.setMinimumWidth(200)
+        self.model_combo.setMaximumWidth(340)
+        self.model_combo.setCursor(Qt.PointingHandCursor)
+        self.model_combo.setToolTip(tr("chat.model_tip"))
+        self.model_combo.setStyleSheet(self._model_combo_qss())
+        self.model_combo.currentIndexChanged.connect(self._on_model_selected)
+        toolbar.addWidget(self.model_combo)
+
+        refresh_btn = QPushButton("⟳")
+        refresh_btn.setObjectName("chatModelRefresh")
+        refresh_btn.setCursor(Qt.PointingHandCursor)
+        refresh_btn.setToolTip(tr("chat.refresh"))
+        refresh_btn.clicked.connect(self._load_models)
+        refresh_btn.setStyleSheet(self._chip_btn_qss())
+        toolbar.addWidget(refresh_btn)
 
         self.attach_btn = QPushButton(tr("chat.attach"))
         self.attach_btn.setCursor(Qt.PointingHandCursor)
@@ -547,6 +563,20 @@ class ChatPage(QWidget):
             " padding: 3px 12px; font-size: 12px; }"
             f" QPushButton:hover {{ color: {c('accent')}; background: {c('accent_soft')};"
             f" border-color: {c('accent_border')}; }}"
+        )
+
+    @staticmethod
+    def _model_combo_qss() -> str:
+        return (
+            f"QComboBox#chatModelCombo {{ color: {c('fg')}; background: {c('surface')};"
+            f" border: 1px solid {c('chip_border')}; border-radius: 12px;"
+            " padding: 3px 10px; font-size: 12px; }"
+            f" QComboBox#chatModelCombo:hover {{ border-color: {c('accent_border')}; }}"
+            f" QComboBox#chatModelCombo::drop-down {{ border: none; width: 18px; }}"
+            f" QComboBox#chatModelCombo QAbstractItemView {{"
+            f" background: {c('surface')}; color: {c('fg')};"
+            f" border: 1px solid {c('border')}; selection-background-color: {c('accent_soft')};"
+            f" selection-color: {c('fg')}; }}"
         )
 
     @staticmethod
@@ -1104,8 +1134,13 @@ class ChatPage(QWidget):
             self.chat_messages_layout.addStretch(1)
             return
         conv = self.conversations[self.current_conv_id]
-        model_index = self.model_combo.findData(conv.get("model_name", ""))
-        self.model_combo.setCurrentIndex(max(0, model_index))
+        # Restoring the conversation's model must not fire the auto-load handler.
+        self._programmatic_change = True
+        try:
+            model_index = self.model_combo.findData(conv.get("model_name", ""))
+            self.model_combo.setCurrentIndex(max(0, model_index))
+        finally:
+            self._programmatic_change = False
         last_idx = len(conv["messages"]) - 1
         for msg_idx, msg in enumerate(conv["messages"]):
             role = msg["role"]
@@ -1445,15 +1480,128 @@ class ChatPage(QWidget):
         return text
 
     def _load_models(self):
-        self.model_combo.clear()
-        loaded = self.api.get_loaded_models()
-        if loaded:
+        """Fetch every model + the loaded set off the main thread.
+
+        Called from the constructor, navigation and the refresh button. A
+        synchronous request here froze the window for up to the request timeout
+        whenever the backend was still booting, so both fetches run in a worker
+        and the combo fills on the result.
+        """
+        from lmloader.gui.api_client import run_in_thread
+
+        if getattr(self, "_models_loading", False):
+            return
+        self._models_loading = True
+
+        def fetch():
+            return self.api.list_models(), self.api.get_loaded_models()
+
+        def on_result(res):
+            self._models_loading = False
+            all_models, loaded = res
+            self._populate_model_combo(all_models or [], loaded or [])
+
+        def on_error(_err):
+            self._models_loading = False
+            self._populate_model_combo([], [])
+
+        run_in_thread(fetch, on_result, on_error)
+
+    def _populate_model_combo(self, all_models: list, loaded: list):
+        prev = self.model_combo.currentData()
+        self._programmatic_change = True
+        try:
+            self.model_combo.clear()
+            self._decision_models = set()
+            self._model_loaded_map = {}
+
+            loaded_by_name = {}
             for item in loaded:
-                name = item["model"]["name"]
-                port = item["port"]
-                self.model_combo.addItem(f"{name} (:{port})", name)
-        else:
-            self.model_combo.addItem("(No models loaded)", "")
+                nm = (item.get("model") or {}).get("name")
+                if nm:
+                    loaded_by_name[nm] = item
+
+            # Loaded models first (with their live port), then the rest.
+            ordered = [(nm, True, item) for nm, item in loaded_by_name.items()]
+            ordered += [
+                (m.get("name"), False, m)
+                for m in all_models
+                if m.get("name") and m.get("name") not in loaded_by_name
+            ]
+
+            for nm, is_loaded, item in ordered:
+                self._model_loaded_map[nm] = is_loaded
+                if is_loaded:
+                    port = item.get("port")
+                    if item.get("engine_kind") == "d3":
+                        self._decision_models.add(nm)
+                        self.model_combo.addItem(
+                            f"{nm} (:{port}) · {tr('chat.decision_tag')} ✓", nm
+                        )
+                    else:
+                        self.model_combo.addItem(f"{nm} (:{port}) ✓", nm)
+                else:
+                    meta = item.get("metadata") or {}
+                    if item.get("is_decision_model") or meta.get("decision_type"):
+                        self._decision_models.add(nm)
+                    self.model_combo.addItem(
+                        f"{nm} · {tr('chat.unloaded_suffix')}", nm
+                    )
+
+            if not ordered:
+                self.model_combo.addItem(tr("chat.no_models_available"), "")
+
+            if prev:
+                self.model_combo.setCurrentIndex(max(0, self.model_combo.findData(prev)))
+        finally:
+            self._programmatic_change = False
+
+    def _on_model_selected(self, _index: int):
+        """Auto-load a model the moment it is chosen from the dropdown.
+
+        Programmatic repopulation and an in-flight switch must not retrigger a
+        load, so both are guarded. Already-loaded models are a no-op: the combo
+        value is simply read at send time.
+        """
+        if getattr(self, "_programmatic_change", False) or getattr(self, "_model_switching", False):
+            return
+        name = self.model_combo.currentData()
+        if not name or self._model_loaded_map.get(name, True):
+            return
+        self._switch_to_model(name)
+
+    def _switch_to_model(self, name: str):
+        from lmloader.gui.api_client import run_in_thread
+
+        self._model_switching = True
+        self.model_combo.setEnabled(False)
+        idx = self.model_combo.currentIndex()
+        if idx >= 0:
+            self.model_combo.setItemText(idx, tr("chat.model_loading"))
+
+        def work():
+            # keep_previous=True: never unload the models already resident.
+            return self.api.load_model(name, keep_previous=True)
+
+        def on_result(_data):
+            self._model_switching = False
+            self.model_combo.setEnabled(True)
+            self._load_models()
+            self._append_message_bubble(
+                tr("chat.system"), tr("chat.model_load_ok").format(name=name),
+                c("accent_soft"), c("accent_border"),
+            )
+
+        def on_error(err):
+            self._model_switching = False
+            self.model_combo.setEnabled(True)
+            self._load_models()
+            self._append_message_bubble(
+                tr("chat.system"), tr("chat.model_load_fail").format(err=str(err)),
+                c("red_bg"), c("red_border"),
+            )
+
+        run_in_thread(work, on_result, on_error)
 
     def _send_message(self):
         if self._is_streaming:
@@ -1468,6 +1616,14 @@ class ChatPage(QWidget):
         model_name = self.model_combo.currentData()
         if not model_name:
             self._append_message_bubble(tr("chat.system"), tr("chat.no_model_loaded"), c("red_bg"), c("red_border"))
+            return
+
+        if model_name in self._decision_models:
+            self._append_message_bubble(
+                tr("chat.system"),
+                tr("chat.decision_model_hint").format(name=model_name),
+                c("red_bg"), c("red_border"),
+            )
             return
 
         if self.current_conv_id is None:

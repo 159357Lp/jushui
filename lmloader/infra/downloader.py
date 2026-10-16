@@ -259,7 +259,7 @@ class ModelDownloader:
             logger.info(f"Model already registered by filename: {file_path.name}")
             return
 
-        metadata = parse_gguf(str(file_path))
+        metadata = await asyncio.to_thread(parse_gguf, str(file_path))
         if not metadata:
             logger.warning(f"Could not parse GGUF metadata: {file_path.name}")
             return

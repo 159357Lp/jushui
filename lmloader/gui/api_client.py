@@ -44,6 +44,45 @@ def _http_detail(e: "httpx.HTTPStatusError") -> str:
     return str(e)
 
 
+_pool_lock = threading.Lock()
+_pooled: dict[tuple, httpx.Client] = {}
+
+
+def _client_for(url: str, headers: Optional[dict]) -> httpx.Client:
+    """One pooled client per (origin, headers) pair.
+
+    Constructing an httpx Client costs ~200ms of CPU on Windows (it builds an
+    SSL context every time), and the pages poll endpoints several times a
+    second, so per-call clients pin a core while the app does nothing else.
+    httpx.Client is thread-safe, which the QThread workers rely on.
+    """
+    url_parts = httpx.URL(url)
+    key = (url_parts.scheme, url_parts.host, url_parts.port,
+           tuple(sorted((headers or {}).items())))
+    with _pool_lock:
+        client = _pooled.get(key)
+        if client is None:
+            client = httpx.Client(timeout=10.0)
+            _pooled[key] = client
+        return client
+
+
+def http_request(method: str, url: str, **kw):
+    return _client_for(url, kw.get("headers")).request(method, url, **kw)
+
+
+def http_get(url, **kw):
+    return http_request("GET", url, **kw)
+
+
+def http_post(url, **kw):
+    return http_request("POST", url, **kw)
+
+
+def http_delete(url, **kw):
+    return http_request("DELETE", url, **kw)
+
+
 class LMLoaderAPI:
     def __init__(self, base_url: str = "http://127.0.0.1:8900", token: str = ""):
         self.base_url = base_url.rstrip("/")
@@ -59,14 +98,14 @@ class LMLoaderAPI:
 
     def health(self) -> bool:
         try:
-            resp = httpx.get(f"{self.base_url}/health", headers=self._headers(), timeout=3.0)
+            resp = http_get(f"{self.base_url}/health", headers=self._headers(), timeout=3.0)
             return resp.status_code == 200
         except Exception:
             return False
 
     def list_models(self) -> list[dict]:
         try:
-            resp = httpx.get(f"{self.base_url}/api/models", headers=self._headers(), timeout=10.0)
+            resp = http_get(f"{self.base_url}/api/models", headers=self._headers(), timeout=10.0)
             resp.raise_for_status()
             return resp.json().get("models", [])
         except Exception:
@@ -92,14 +131,14 @@ class LMLoaderAPI:
         for anything reconciling state.
         """
         try:
-            resp = httpx.get(f"{self.base_url}/api/models/loaded", headers=self._headers(), timeout=10.0)
+            resp = http_get(f"{self.base_url}/api/models/loaded", headers=self._headers(), timeout=10.0)
             resp.raise_for_status()
             return resp.json().get("loaded", [])
         except Exception:
             return None
 
     def load_model(self, model_name: str, keep_previous: bool = False) -> dict:
-        resp = httpx.post(
+        resp = http_post(
             f"{self.base_url}/api/models/load",
             json={"model_name": model_name, "keep_previous": keep_previous},
             headers=self._headers(),
@@ -109,7 +148,7 @@ class LMLoaderAPI:
         return resp.json()
 
     def unload_model(self, model_name: str) -> dict:
-        resp = httpx.post(
+        resp = http_post(
             f"{self.base_url}/api/models/unload",
             params={"model_name": model_name},
             headers=self._headers(),
@@ -119,7 +158,7 @@ class LMLoaderAPI:
         return resp.json()
 
     def toggle_vision(self, model_name: str, enabled: bool) -> dict:
-        resp = httpx.post(
+        resp = http_post(
             f"{self.base_url}/api/models/vision",
             json={"model_name": model_name, "enabled": enabled},
             headers=self._headers(),
@@ -129,7 +168,7 @@ class LMLoaderAPI:
         return resp.json()
 
     def switch_model(self, model_name: str, keep_previous: bool = False) -> dict:
-        resp = httpx.post(
+        resp = http_post(
             f"{self.base_url}/api/models/switch",
             json={"model_name": model_name, "keep_previous": keep_previous},
             headers=self._headers(),
@@ -139,13 +178,13 @@ class LMLoaderAPI:
         return resp.json()
 
     def scan_models(self) -> dict:
-        resp = httpx.post(f"{self.base_url}/api/models/scan", headers=self._headers(), timeout=60.0)
+        resp = http_post(f"{self.base_url}/api/models/scan", headers=self._headers(), timeout=60.0)
         resp.raise_for_status()
         return resp.json()
 
     def get_engine(self) -> dict:
         try:
-            resp = httpx.get(f"{self.base_url}/api/engine", headers=self._headers(), timeout=10.0)
+            resp = http_get(f"{self.base_url}/api/engine", headers=self._headers(), timeout=10.0)
             resp.raise_for_status()
             return resp.json()
         except Exception:
@@ -153,7 +192,7 @@ class LMLoaderAPI:
 
     def get_monitor(self) -> dict:  # FIXED: G3
         try:
-            resp = httpx.get(f"{self.base_url}/api/monitor", headers=self._headers(), timeout=10.0)
+            resp = http_get(f"{self.base_url}/api/monitor", headers=self._headers(), timeout=10.0)
             resp.raise_for_status()
             return resp.json()
         except Exception:
@@ -161,7 +200,7 @@ class LMLoaderAPI:
 
     def get_events(self, since_id: int = 0, level: str = "all") -> dict:
         try:
-            resp = httpx.get(
+            resp = http_get(
                 f"{self.base_url}/api/events",
                 params={"since_id": since_id, "level": level, "limit": 500},
                 headers=self._headers(),
@@ -173,7 +212,7 @@ class LMLoaderAPI:
             return {"events": [], "last_id": since_id}
 
     def clear_events(self) -> dict:
-        resp = httpx.post(f"{self.base_url}/api/events/clear", headers=self._headers(), timeout=10.0)
+        resp = http_post(f"{self.base_url}/api/events/clear", headers=self._headers(), timeout=10.0)
         resp.raise_for_status()
         return resp.json()
 
@@ -190,7 +229,7 @@ class LMLoaderAPI:
             payload["max_tokens"] = int(max_tokens)
         if not thinking:
             payload["chat_template_kwargs"] = {"enable_thinking": False}
-        resp = httpx.post(
+        resp = http_post(
             f"{self.base_url}/v1/chat/completions",
             json=payload,
             headers=self._headers(),
@@ -261,7 +300,7 @@ class LMLoaderAPI:
 
     def engine_update_status(self, slot: str = "ternary") -> dict:
         try:
-            resp = httpx.get(
+            resp = http_get(
                 f"{self.base_url}/api/engine/update-status",
                 params={"slot": slot}, headers=self._headers(), timeout=10.0,
             )
@@ -272,7 +311,7 @@ class LMLoaderAPI:
 
     def check_engine_update(self, slot: str = "ternary") -> dict:
         try:
-            resp = httpx.post(
+            resp = http_post(
                 f"{self.base_url}/api/engine/check-update",
                 params={"slot": slot}, headers=self._headers(), timeout=60.0,
             )
@@ -283,7 +322,7 @@ class LMLoaderAPI:
 
     def update_engine(self, slot: str = "ternary") -> dict:
         try:
-            resp = httpx.post(
+            resp = http_post(
                 f"{self.base_url}/api/engine/update",
                 params={"slot": slot}, headers=self._headers(), timeout=1200.0,
             )
@@ -294,7 +333,7 @@ class LMLoaderAPI:
 
     def rollback_engine(self, slot: str = "ternary") -> dict:
         try:
-            resp = httpx.post(
+            resp = http_post(
                 f"{self.base_url}/api/engine/rollback",
                 params={"slot": slot}, headers=self._headers(), timeout=300.0,
             )
@@ -305,19 +344,19 @@ class LMLoaderAPI:
 
     def engine_discover(self) -> dict:
         try:
-            resp = httpx.get(f"{self.base_url}/api/engine/discover", headers=self._headers(), timeout=15.0)
+            resp = http_get(f"{self.base_url}/api/engine/discover", headers=self._headers(), timeout=15.0)
             resp.raise_for_status()
             return resp.json()
         except Exception:
             return {"discovered": [], "scan_dirs": []}
 
     def set_engine_scan_dirs(self, scan_dirs: list[str]) -> dict:
-        resp = httpx.post(f"{self.base_url}/api/engine/scan-dirs", json={"scan_dirs": scan_dirs}, headers=self._headers(), timeout=15.0)
+        resp = http_post(f"{self.base_url}/api/engine/scan-dirs", json={"scan_dirs": scan_dirs}, headers=self._headers(), timeout=15.0)
         resp.raise_for_status()
         return resp.json()
 
     def add_custom_engine(self, name: str, kind: str, binary_path: str) -> dict:
-        resp = httpx.post(
+        resp = http_post(
             f"{self.base_url}/api/engine/custom",
             json={"name": name, "kind": kind, "binary_path": binary_path},
             headers=self._headers(),
@@ -329,14 +368,14 @@ class LMLoaderAPI:
     # ---- per-model run config (LM Studio style) ----
 
     def get_model_run_config(self, model_name: str) -> dict:
-        resp = httpx.get(
+        resp = http_get(
             f"{self.base_url}/api/models/{model_name}/config", headers=self._headers(), timeout=10.0,
         )
         resp.raise_for_status()
         return resp.json()
 
     def save_model_run_config(self, model_name: str, cfg: dict) -> dict:
-        resp = httpx.post(
+        resp = http_post(
             f"{self.base_url}/api/models/{model_name}/config",
             json=cfg, headers=self._headers(), timeout=10.0,
         )
@@ -344,7 +383,7 @@ class LMLoaderAPI:
         return resp.json()
 
     def delete_model_run_config(self, model_name: str) -> dict:
-        resp = httpx.delete(
+        resp = http_delete(
             f"{self.base_url}/api/models/{model_name}/config", headers=self._headers(), timeout=10.0,
         )
         resp.raise_for_status()
@@ -353,12 +392,12 @@ class LMLoaderAPI:
     # ---- download settings (proxy / ollama store) ----
 
     def get_download_config(self) -> dict:
-        resp = httpx.get(f"{self.base_url}/api/download/config", headers=self._headers(), timeout=10.0)
+        resp = http_get(f"{self.base_url}/api/download/config", headers=self._headers(), timeout=10.0)
         resp.raise_for_status()
         return resp.json()
 
     def set_download_config(self, cfg: dict) -> dict:
-        resp = httpx.post(
+        resp = http_post(
             f"{self.base_url}/api/download/config", json=cfg, headers=self._headers(), timeout=10.0,
         )
         resp.raise_for_status()
@@ -369,7 +408,7 @@ class LMLoaderAPI:
     def get_pending_config_changes(self) -> list[dict]:
         """Poll for pending config-change requests waiting for user approval."""
         try:
-            resp = httpx.get(
+            resp = http_get(
                 f"{self.base_url}/api/config/pending",
                 headers=self._headers(), timeout=5.0,
             )
@@ -379,7 +418,7 @@ class LMLoaderAPI:
             return []
 
     def approve_config_change(self, request_id: str) -> dict:
-        resp = httpx.post(
+        resp = http_post(
             f"{self.base_url}/api/config/approve/{request_id}",
             headers=self._headers(), timeout=10.0,
         )
@@ -387,7 +426,7 @@ class LMLoaderAPI:
         return resp.json()
 
     def reject_config_change(self, request_id: str) -> dict:
-        resp = httpx.post(
+        resp = http_post(
             f"{self.base_url}/api/config/reject/{request_id}",
             headers=self._headers(), timeout=10.0,
         )

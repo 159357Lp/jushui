@@ -10,6 +10,7 @@ from PySide6.QtGui import (
     QIcon, QAction, QColor, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
 )
 
+from lmloader import __version__
 from lmloader.gui.api_client import LMLoaderAPI, run_in_thread
 from lmloader.gui.i18n import tr, get_language
 from lmloader.gui.pages.chat import ChatPage
@@ -74,7 +75,7 @@ def _load_theme_from_config() -> str:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("LM Loader")
+        self.setWindowTitle("掬水")
         self.setMinimumSize(1000, 680)
         self.resize(1200, 800)
 
@@ -115,6 +116,17 @@ class MainWindow(QMainWindow):
         self._guardian_timer.setInterval(1000)
         self._guardian_timer.timeout.connect(self._poll_guardian)
         self._guardian_timer.start()
+
+        # ---- Connection watchdog ----
+        # The one-shot check at startup froze on a still-booting backend (the
+        # GUI opens before serve is ready), leaving the badge stuck at 未连接
+        # even after the backend comes up. Re-probe periodically so the status
+        # self-heals on boot and flips back to 未连接 if the backend dies.
+        # Cheap now that httpx Client is pooled, and it runs off-thread.
+        self._conn_timer = QTimer(self)
+        self._conn_timer.setInterval(2000)
+        self._conn_timer.timeout.connect(self._check_connection)
+        self._conn_timer.start()
 
     def _on_theme_changed(self, theme: str):
         app = QApplication.instance()
@@ -210,10 +222,10 @@ class MainWindow(QMainWindow):
         self.toggle_btn.clicked.connect(self._toggle_sidebar)
         layout.addWidget(self.toggle_btn)
 
-        self.logo_label = QLabel("LM Loader")  # color set by _apply_sidebar_style
+        self.logo_label = QLabel("掬水")  # color set by _apply_sidebar_style
         layout.addWidget(self.logo_label)
 
-        self.ver_label = QLabel("v0.2.0")
+        self.ver_label = QLabel(f"v{__version__}")
         self.ver_label.setObjectName("subtitle")
         self.ver_label.setStyleSheet("padding: 0 12px 10px 12px;")
         layout.addWidget(self.ver_label)
@@ -433,6 +445,8 @@ class MainWindow(QMainWindow):
         run_in_thread(self.api.health, on_result, on_error)
 
     def _update_connection_status(self, connected: bool):
+        was_connected = getattr(self, "_was_connected", False)
+        self._was_connected = connected
         if connected:
             self.conn_label.setText(tr("status.connected"))
             dot_color = theme_color("green")
@@ -443,6 +457,12 @@ class MainWindow(QMainWindow):
         if hasattr(self, "conn_dot"):
             self.conn_dot.setStyleSheet(f"color: {dot_color}; font-size: 12px;")
             self.conn_dot.setToolTip(self.conn_label.text())
+        # On the offline→online edge, refresh whatever page is showing so data
+        # that was fetched during the outage (e.g. the chat model list) repopulates.
+        if connected and not was_connected:
+            current = self.stack.currentWidget()
+            if current is not None and hasattr(current, "on_navigate"):
+                current.on_navigate()
 
     # ---- ConfigGuardian: poll & confirm config changes ----
 
@@ -506,7 +526,7 @@ class MainWindow(QMainWindow):
 
     def _setup_tray(self):
         self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setToolTip("LM Loader")
+        self.tray_icon.setToolTip("掬水")
 
         # Was `icon = QIcon()` — always null, so the `if not icon.isNull()`
         # branch never fired and the blue-dot fallback below was the only path
@@ -569,7 +589,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             self.hide()
             self.tray_icon.showMessage(
-                "LM Loader",
+                "掬水",
                 tr("tray.minimized"),
                 QSystemTrayIcon.Information,
                 2000,

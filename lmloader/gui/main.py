@@ -12,7 +12,7 @@ def _no_window():
     return no_window_kwargs()
 
 
-def _focus_existing_window(title: str = "LM Loader") -> bool:
+def _focus_existing_window(title: str = "掬水") -> bool:
     """Bring the already-running app window to the foreground (Windows)."""
     if sys.platform != "win32":
         return False
@@ -67,41 +67,39 @@ def _acquire_single_instance():
 
 
 def _ensure_backend():  # FIXED: G5
-    """Start the backend server if not already running."""
-    import httpx
+    """Start the backend server if it isn't running — without blocking the UI.
+
+    A cold backend takes several seconds to boot. The old code polled /health
+    here for up to 15s *before* ``window.show()``, which froze the main thread
+    and left Windows spinning the cursor. Now we do a single quick probe to
+    reuse an already-running backend, otherwise spawn one and return
+    immediately; the window's connection watchdog reports when it's actually
+    ready.
+    """
+    from lmloader.gui.api_client import http_get
     try:
-        resp = httpx.get("http://127.0.0.1:8900/health", timeout=2.0)
+        resp = http_get("http://127.0.0.1:8900/health", timeout=1.0)
         if resp.status_code == 200:
             pid = resp.headers.get("X-LM-Loader-Pid")
             return int(pid) if pid and pid.isdigit() else None
     except Exception:
         pass
 
-    proc = subprocess.Popen(
+    return subprocess.Popen(
         [sys.executable, "-m", "lmloader.cli", "serve"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         **_no_window(),
     )
 
-    for _ in range(30):
-        time.sleep(0.5)
-        try:
-            resp = httpx.get("http://127.0.0.1:8900/health", timeout=2.0)
-            if resp.status_code == 200:
-                return proc
-        except Exception:
-            pass
-
-    return proc
-
 
 def main():
     from PySide6.QtWidgets import QApplication
+    from lmloader import __version__
 
     app = QApplication(sys.argv)
-    app.setApplicationName("LM Loader")
-    app.setApplicationVersion("0.2.0")
+    app.setApplicationName("掬水")
+    app.setApplicationVersion(__version__)
     app.setQuitOnLastWindowClosed(False)
 
     # Single-instance lock: a second launch focuses the existing window and
@@ -141,6 +139,7 @@ def _shutdown_backend(backend_proc):
     backend keeps its models resident in VRAM after the GUI closes.
     """
     import httpx
+    from lmloader.gui.api_client import http_get, http_post
     from lmloader.infra.proc_util import kill_process_tree
 
     backend_pid = (
@@ -148,7 +147,7 @@ def _shutdown_backend(backend_proc):
         else backend_proc
     )
     try:
-        httpx.post("http://127.0.0.1:8900/api/shutdown", timeout=3.0)
+        http_post("http://127.0.0.1:8900/api/shutdown", timeout=3.0)
     except Exception:
         pass
 
@@ -159,7 +158,7 @@ def _shutdown_backend(backend_proc):
                 return
         else:
             try:
-                httpx.get("http://127.0.0.1:8900/health", timeout=0.5)
+                http_get("http://127.0.0.1:8900/health", timeout=0.5)
             except Exception:
                 return
         time.sleep(0.25)

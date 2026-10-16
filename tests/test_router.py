@@ -1,5 +1,7 @@
 """Tests for engine router — quantization-based routing."""
 
+import struct
+
 import pytest
 from unittest.mock import MagicMock
 
@@ -110,3 +112,151 @@ def test_non_bonsai_keeps_repetition_suppression(router, monkeypatch):
     assert args[rp_idx + 1] == "1.1"
     dry_idx = args.index("--dry-multiplier")
     assert args[dry_idx + 1] == "0.8"
+
+
+# ------------------------------------------------------------- vLLM routing
+
+import sys as _sys
+
+_ROUTER_MOD = _sys.modules["lmloader.engine.router"]
+_VLLM_ENGINE = {"name": "vllm@vllm", "kind": "vllm", "formats": [".safetensors"]}
+
+
+def _make_hf_model(name="hf-model", path="D:/models/hf-model"):
+    m = MagicMock()
+    m.name = name
+    m.path = path
+    m.metadata = {"hf_model": True}
+    m.backend = None
+    return m
+
+
+def test_hf_dir_resolves_to_vllm(router, monkeypatch):
+    monkeypatch.setattr(_ROUTER_MOD, "find_engine_by_kind",
+                        lambda k, discovered=None: _VLLM_ENGINE)
+    slot, kind = router.resolve_engine(_make_hf_model())
+    assert slot == "vllm@vllm" and kind == "vllm"
+
+
+def test_hf_dir_without_vllm_engine_returns_none(router, monkeypatch):
+    monkeypatch.setattr(_ROUTER_MOD, "find_engine_by_kind",
+                        lambda k, discovered=None: None)
+    slot, kind = router.resolve_engine(_make_hf_model())
+    assert slot is None and kind == ""
+
+
+def test_safetensors_resolves_to_vllm(router, monkeypatch):
+    monkeypatch.setattr(_ROUTER_MOD, "find_engine_for_format",
+                        lambda ext, discovered=None: _VLLM_ENGINE)
+    m = MagicMock()
+    m.name = "model.safetensors"
+    m.path = "D:/models/model.safetensors"
+    m.metadata = {}
+    m.backend = None
+    slot, kind = router.resolve_engine(m)
+    assert slot == "vllm@vllm" and kind == "vllm"
+
+
+def test_vllm_launch_args_handle_spaces(router, monkeypatch):
+    monkeypatch.setattr(_ROUTER_MOD, "find_engine_by_kind",
+                        lambda k, discovered=None: _VLLM_ENGINE)
+    lc = router.build_launch_config(
+        _make_hf_model(path="D:/my models/hf"), 8123)
+    assert lc.kind == "vllm"
+    # Paths with spaces are passed as a single token; the served name is the
+    # DB name (so the GUI's model field matches) with the path as an alias;
+    # the default VRAM cap is appended so vLLM does not reserve ~92% of the GPU.
+    assert lc.args == [
+        "serve", "D:/my models/hf",
+        "--host", "127.0.0.1", "--port", "8123",
+        "--served-model-name", "hf-model",
+        "--gpu-memory-utilization", "0.85",
+    ]
+
+
+def test_vllm_served_model_name_matches_db_name(router, monkeypatch):
+    # The GUI/proxy send the model's registered NAME; vLLM must serve under
+    # that name or it 404s and the chat shows an empty reply.
+    monkeypatch.setattr(_ROUTER_MOD, "find_engine_by_kind",
+                        lambda k, discovered=None: _VLLM_ENGINE)
+    lc = router.build_launch_config(
+        _make_hf_model(name="Qwen2.5-0.5B-Instruct",
+                      path="D:/models/Qwen2.5-0.5B-Instruct"), 8100)
+    i = lc.args.index("--served-model-name")
+    assert lc.args[i + 1] == "Qwen2.5-0.5B-Instruct"
+    # The positional model is still the directory path.
+    assert lc.args[1] == "D:/models/Qwen2.5-0.5B-Instruct"
+
+
+def test_vllm_launch_args_respect_custom_memory_util(router, monkeypatch):
+    monkeypatch.setattr(_ROUTER_MOD, "find_engine_by_kind",
+                        lambda k, discovered=None: _VLLM_ENGINE)
+    _ROUTER_MOD.settings.vllm.gpu_memory_utilization = 0.6
+    _ROUTER_MOD.settings.vllm.max_model_len = 4096
+    try:
+        lc = router.build_launch_config(_make_hf_model(), 8123)
+    finally:
+        _ROUTER_MOD.settings.vllm.gpu_memory_utilization = 0.85
+        _ROUTER_MOD.settings.vllm.max_model_len = None
+    assert lc.args == [
+        "serve", "D:/models/hf-model",
+        "--host", "127.0.0.1", "--port", "8123",
+        "--served-model-name", "hf-model",
+        "--gpu-memory-utilization", "0.6",
+        "--max-model-len", "4096",
+    ]
+
+
+def test_gguf_never_routes_to_vllm(router):
+    # A GGUF record with the hf_model marker still routes by quant to the
+    # built-in engines, so vLLM can never hijack GGUF models.
+    m = _make_model("Q4_K_M", "m.gguf")
+    m.path = "D:/models/m.gguf"
+    m.metadata = {"hf_model": True}
+    m.backend = None
+    slot, kind = router.resolve_engine(m)
+    assert slot == "primary" and kind == "llama"
+
+
+def _d3_pkg(tmp_path, *, vision=True, video=True, index=True, tag="d3-pkg"):
+    """A minimal directory that passes is_d3_package, with switchable modalities."""
+    import json
+    from pathlib import Path
+
+    pkg = Path(tmp_path) / tag
+    pkg.mkdir(exist_ok=True)
+    (pkg / "d3_server.py").write_text("#", encoding="utf-8")
+    (pkg / "MODEL_MANIFEST.json").write_text(
+        json.dumps({"schema": "d3-package-manifest/1"}), encoding="utf-8"
+    )
+    (pkg / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5" if video else "qwen3_vl"}), encoding="utf-8"
+    )
+    if video:
+        (pkg / "video_preprocessor_config.json").write_text("{}", encoding="utf-8")
+    names = ["readout.weight"] + (["visual.blocks.0.attn.proj.weight"] if vision else [])
+    if index:
+        (pkg / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {n: "model.safetensors" for n in names}}), encoding="utf-8"
+        )
+    else:
+        # No index: the router must read the tensor names out of the
+        # safetensors header itself (8-byte length, then JSON).
+        header = json.dumps({n: {} for n in names}).encode("utf-8")
+        (pkg / "model.safetensors").write_bytes(struct.pack("<Q", len(header)) + header)
+    m = _make_model("", "d3-pkg")
+    m.path = str(pkg)
+    m.metadata = {}
+    return m
+
+
+def test_d3_modalities_from_manifest_package(router, tmp_path):
+    assert router.is_d3_package(_d3_pkg(tmp_path, tag="full"))
+    assert router.d3_modalities(_d3_pkg(tmp_path, tag="full")) == ["text", "image", "video"]
+    assert router.d3_modalities(_d3_pkg(tmp_path, tag="img", video=False)) == ["text", "image"]
+    assert router.d3_modalities(_d3_pkg(tmp_path, tag="txt", vision=False)) == ["text"]
+
+
+def test_d3_modalities_without_shard_index(router, tmp_path):
+    model = _d3_pkg(tmp_path, index=False)
+    assert router.d3_modalities(model) == ["text", "image", "video"]

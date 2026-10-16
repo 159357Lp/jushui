@@ -1,10 +1,12 @@
 """Engine router — select engine based on GGUF quantization type / format."""
 
+import json
+import struct
 from pathlib import Path
 from typing import Optional
 
 from lmloader.config import settings
-from lmloader.engine.discovery import find_engine_for_format
+from lmloader.engine.discovery import find_engine_by_kind, find_engine_for_format
 from lmloader.engine.kinds import ENGINE_KINDS, format_of
 from lmloader.infra.database import ModelRecord
 from lmloader.infra.events import event_log
@@ -28,6 +30,9 @@ TERNARY_QUANT_TYPES = {
 
 # Values the bundled llama.cpp engine actually accepts for KV cache quant.
 CACHE_TYPES = ("q8_0", "q4_0", "f16", "q8_1")
+
+# MODEL_MANIFEST.json schema of a Decision 3.0 package (d3-mini and friends).
+D3_MANIFEST_SCHEMA = "d3-package-manifest/1"
 MAX_PARALLEL = 8
 MAX_SPEC_DRAFT = 16
 
@@ -192,7 +197,55 @@ class EngineRouter:
         """
         ext = Path(model.path).suffix.lower()
         if ext in (".gguf", ".ggml") or model.backend == "ollama":
+            # A decision-type GGUF (``<arch>.decision.type``, e.g. "vllm-d3") is
+            # only loadable by an engine whose build knows that name; the
+            # bundled binary/ternary builds abort on it with
+            # "unsupported decision model type". Route those to a dedicated
+            # d3-gguf engine when registered, and leave every ordinary GGUF on
+            # the quantization-based slot selection below.
+            decision_type = str((model.metadata or {}).get("decision_type") or "")
+            if decision_type:
+                eng = find_engine_by_kind("d3-gguf")
+                if eng is not None:
+                    logger.info(
+                        f"Model {model.name} is a decision GGUF ({decision_type}), "
+                        f"routed to engine '{eng['name']}'"
+                    )
+                    return eng["name"], "llama"
+                event_log.warning(
+                    "engine",
+                    f"模型 {model.name} 声明决策类型 {decision_type}，"
+                    f"当前引擎不认识它。请在设置里注册一个 'd3-gguf' 类型的自定义引擎。",
+                    model=model.name,
+                )
             return self.select_engine_slot(model), "llama"
+        # d3 packages first: they also look like a plain HF directory
+        # (config.json + *.safetensors) but vLLM cannot load them at all —
+        # their weights live under language_model./visual. prefixes behind a
+        # trust_remote_code architecture, so feeding one to vLLM only burns the
+        # whole startup timeout and then reports a bare load failure.
+        if self.is_d3_package(model):
+            eng = find_engine_by_kind("d3")
+            if eng is None:
+                logger.error(
+                    f"Model {model.name} is a Decision 3.0 package, but no Python engine was found. "
+                    f"Add a venv Scripts directory (one containing python.exe) to the engine scan dirs."
+                )
+                return None, ""
+            logger.info(f"Model {model.name} is a Decision 3.0 package, routed to d3 engine '{eng['name']}'")
+            return eng["name"], "d3"
+        # HuggingFace model directory (config.json + safetensors, no file
+        # extension) -> vLLM. GGUF/GGML above are never redirected here.
+        if self._is_hf_model_dir(model):
+            eng = find_engine_by_kind("vllm")
+            if eng is None:
+                logger.error(
+                    f"Model {model.name} is a HuggingFace directory, but no vLLM engine was found. "
+                    f"Add a vLLM engine in Settings (custom engine or scan dir)."
+                )
+                return None, ""
+            logger.info(f"Model {model.name} is a HuggingFace directory, routed to vLLM engine '{eng['name']}'")
+            return eng["name"], "vllm"
         fmt = format_of(model.path)
         eng = find_engine_for_format(ext)
         if eng is None:
@@ -217,6 +270,81 @@ class EngineRouter:
             raise ValueError(
                 f"没有支持 {format_of(model.path) or Path(model.path).suffix} 格式的引擎。"
                 f"请在设置中添加引擎搜索目录或自定义引擎。"
+            )
+
+        # d3: `python <pkg>/d3_server.py --model <pkg> --port ...`. The binary
+        # is the interpreter, so the script path is the first argument.
+        if kind == "d3":
+            host = "127.0.0.1"
+            script = Path(model.path) / "d3_server.py"
+            args = [
+                str(script),
+                "--model", model.path,
+                "--host", host,
+                "--port", str(port),
+                # Name the server answers with: it reports this in /health and
+                # /v1/models, and lmloader addresses the model by its DB name.
+                "--name", model.name,
+                # The package's own integrity check compares every file against
+                # MODEL_MANIFEST.json. README.md frequently differs (the Hub
+                # mirror rewrites it), which aborts startup for a non-runtime
+                # file, so the loader skips it. Weights are still checked by
+                # shape/dtype when the runtime builds the backbone.
+                "--verify", "none",
+            ]
+            logger.info(
+                f"Launch config for {model.name} (d3): port={port}, script={script}"
+            )
+            return LaunchConfig(
+                model_path=model.path,
+                port=port,
+                args=args,
+                engine_slot=engine_slot,
+                host=host,
+                kind="d3",
+            )
+
+        # vLLM: `vllm serve <model-dir-or-safetensors> --host ... --port ...`.
+        # Built as a list (not the shlex template) so model paths with spaces
+        # and the positional `serve` subcommand are handled correctly.
+        if kind == "vllm":
+            host = "127.0.0.1"
+            # vLLM strictly validates the request's `model` field against the
+            # names it is serving and returns 404 ("model does not exist") on a
+            # mismatch. With no override it serves under the positional model
+            # PATH, while the GUI/proxy send the model's registered NAME — so
+            # every chat returned empty. Pin the served name to the DB name and
+            # also accept the path as an alias. llama.cpp ignores the field, so
+            # only vLLM needs this.
+            # NOTE: vLLM's --served-model-name uses nargs='+'; passing the flag
+            # twice logs "duplicate keys" and only the LAST value survives, so
+            # all aliases must be listed after a single flag (we only need the
+            # DB name — the loader never addresses the model by its raw path).
+            args = [
+                "serve", model.path,
+                "--host", host,
+                "--port", str(port),
+                "--served-model-name", model.name,
+            ]
+            # Cap vLLM's GPU-memory reservation so its default ~0.92 KV-cache
+            # pre-allocation does not consume all VRAM and starve the desktop
+            # or the built-in binary/ternary engines. Tunable in config.yaml.
+            gmu = settings.vllm.gpu_memory_utilization
+            if gmu is not None and 0.0 < float(gmu) < 1.0:
+                args += ["--gpu-memory-utilization", str(float(gmu))]
+            if settings.vllm.max_model_len:
+                args += ["--max-model-len", str(int(settings.vllm.max_model_len))]
+            logger.info(
+                f"Launch config for {model.name} (vLLM): port={port}, "
+                f"model={model.path}, gpu_memory_utilization={gmu}"
+            )
+            return LaunchConfig(
+                model_path=model.path,
+                port=port,
+                args=args,
+                engine_slot=engine_slot,
+                host=host,
+                kind="vllm",
             )
 
         # Non-llama kinds: start from the kind's arg template.
@@ -244,8 +372,15 @@ class EngineRouter:
 
         # Get defaults for the selected engine slot
         engines_config = settings.engines
-        slot_config = getattr(engines_config, engine_slot)
+        # A custom engine (e.g. the d3-gguf build) has a name, not a config
+        # slot, so it has no defaults of its own and inherits primary's. The
+        # binary itself is still resolved from the registry, because capability
+        # probes below must ask the real executable, not the slot they borrow
+        # defaults from.
+        slot_config = getattr(engines_config, engine_slot, None) or engines_config.primary
         defaults = slot_config.defaults
+        from lmloader.engine.registry import engine_registry
+        binary_path = engine_registry.get_binary_path(engine_slot) or slot_config.binary_path
 
         # Per-model saved run config (LM Studio style) overrides slot defaults.
         run_cfg = run_config if run_config is not None else {}
@@ -349,11 +484,11 @@ class EngineRouter:
         except (TypeError, ValueError):
             reasoning_budget = -1
         if reasoning_budget >= 0 and self._engine_supports_reasoning(
-                slot_config.binary_path, engine_slot):
+                binary_path, engine_slot):
             args += ["--reasoning-budget", str(reasoning_budget)]
         elif reasoning_budget >= 0:
             logger.info(
-                f"engine {slot_config.binary_path} predates --reasoning-* flags; "
+                f"engine {binary_path} predates --reasoning-* flags; "
                 f"leaving reasoning_budget={reasoning_budget} unset"
             )
 
@@ -364,6 +499,18 @@ class EngineRouter:
         # sane floor and surface the auto-correction in the runtime log.
         mtp_active = bool(mtp_enabled) and self._has_mtp(model)
         min_ubatch = max(3, int(spec_draft_max or 1) + 2) if mtp_active else 8
+        # Decision GGUF models use non-causal attention, which llama.cpp asserts
+        # only when the whole prompt fits in one physical micro-batch
+        # (src/llama-context.cpp: "non-causal attention requires
+        # n_ubatch >= n_tokens"). A multi-question System One request easily
+        # passes the 512 default, and the assert kills the engine process
+        # mid-request instead of returning an error, so size the micro-batch to
+        # the context the model is actually running with. The 8192 ceiling keeps
+        # the compute buffers sane: a prompt longer than the micro-batch still
+        # trips that assert and aborts the engine, so the context itself must
+        # stay inside this bound for decision models.
+        if str((model.metadata or {}).get("decision_type") or ""):
+            min_ubatch = max(min_ubatch, min(int(cfg["ctx_size"]), 8192))
         if ubatch < min_ubatch:
             event_log.warning(
                 "lifecycle",
@@ -560,6 +707,87 @@ class EngineRouter:
     def _is_vision_encoder(self, model: ModelRecord) -> bool:
         arch = model.architecture.lower()
         return arch in ("clip", "clip_vision", "vision_encoder")
+
+    def is_d3_package(self, model: ModelRecord) -> bool:
+        """A Decision 3.0 package: its manifest schema plus its own server."""
+        p = Path(model.path)
+        if not p.is_dir():
+            return False
+        if not (p / "d3_server.py").is_file():
+            return False
+        manifest = p / "MODEL_MANIFEST.json"
+        if not manifest.is_file():
+            return False
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        return isinstance(data, dict) and data.get("schema") == D3_MANIFEST_SCHEMA
+
+    def d3_modalities(self, model: ModelRecord) -> list[str]:
+        """Input kinds a Decision 3.0 package accepts, read off its files.
+
+        d3 carries its vision tower inside the checkpoint (``visual.*``
+        tensors), so there is no mmproj file for ``find_mmproj`` to trip on —
+        the modality list has to come from the weights and preprocessor config
+        themselves, mirroring ``vision_weights_present`` in the package's own
+        ``d3_runtime.py``.
+        """
+        p = Path(model.path)
+        if not p.is_dir():
+            return ["text"]
+        names = self._d3_tensor_names(p)
+        if not any(n.startswith(("visual.", "model.visual.")) for n in names):
+            return ["text"]
+        modalities = ["text", "image"]
+        if (p / "video_preprocessor_config.json").is_file() and self._d3_backbone(p) == "qwen3_5":
+            modalities.append("video")
+        return modalities
+
+    @staticmethod
+    def _d3_tensor_names(pkg: Path) -> list[str]:
+        index = pkg / "model.safetensors.index.json"
+        if index.is_file():
+            try:
+                return list(json.loads(index.read_text(encoding="utf-8"))["weight_map"])
+            except (OSError, ValueError, KeyError):
+                pass
+        # No index (single-shard or hand-placed package): the tensor names live
+        # in the safetensors header, which is plain JSON behind a length prefix.
+        names: list[str] = []
+        for shard in sorted(pkg.glob("model*.safetensors")):
+            try:
+                with shard.open("rb") as fh:
+                    size = struct.unpack("<Q", fh.read(8))[0]
+                    header = json.loads(fh.read(size).decode("utf-8"))
+            except (OSError, ValueError, UnicodeDecodeError):
+                continue
+            names += [k for k in header if k != "__metadata__"]
+        return names
+
+    @staticmethod
+    def _d3_backbone(pkg: Path) -> str:
+        try:
+            return str(json.loads((pkg / "config.json").read_text(encoding="utf-8")).get("model_type", ""))
+        except (OSError, ValueError):
+            return ""
+
+    def _is_hf_model_dir(self, model: ModelRecord) -> bool:
+        """A HuggingFace model directory vLLM can serve: a directory with
+        config.json and at least one .safetensors weight. Trust the scanner's
+        hf_model metadata when present; otherwise inspect the path."""
+        # The scanner sets hf_model only after inspecting a real directory, and
+        # the lifecycle manager re-checks the path exists at load time, so the
+        # marker is authoritative on its own.
+        if (model.metadata or {}).get("hf_model"):
+            return True
+        p = Path(model.path)
+        if not p.is_dir() or not (p / "config.json").is_file():
+            return False
+        try:
+            return any(p.glob("*.safetensors"))
+        except OSError:
+            return False
 
 
 router = EngineRouter()

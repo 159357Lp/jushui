@@ -63,6 +63,9 @@ class ModelInstance:
         self._stderr_raw: deque[str] = deque(maxlen=80)
         # slot -> latest timing metrics parsed from print_timing output
         self.latest_timing: dict[int, dict] = {}
+        # d3 packages only: the System One contract reported by the package's
+        # own server (modalities, token/media limits). None for other engines.
+        self.system_one: Optional[dict] = None
 
     def is_alive(self) -> bool:
         """True while the engine process is still running.
@@ -96,6 +99,8 @@ class ModelInstance:
             "model": self.model.to_dict(),
             "port": self.launch_config.port,
             "engine_slot": self.launch_config.engine_slot,
+            "engine_kind": self.launch_config.kind,
+            "system_one": self.system_one,
             "base_url": self.base_url,
             "api_base": f"{self.base_url}/v1",
             "pid": self.process.pid,
@@ -501,7 +506,7 @@ class LifecycleManager:
             load_start = time.time()
 
             try:
-                env = self._build_env()
+                env = self._build_env(launch_config)
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,
@@ -557,10 +562,15 @@ class LifecycleManager:
             self._used_ports.add(port)
             await self._safe_status_update(model.id, "loaded")
             elapsed = time.time() - load_start
+            if launch_config.kind == "d3":
+                await self._read_d3_contract(instance)
             vision_part = (
                 f"，视觉已挂载：{Path(launch_config.mmproj_path).name}"
                 if launch_config.mmproj_path else "，纯文本模式"
             )
+            if launch_config.kind == "d3":
+                modalities = "/".join((instance.system_one or {}).get("modalities") or [])
+                vision_part = f"，决策模型（模态：{modalities or 'text'}，走 /v1/systemone）"
             logger.info(
                 f"Loaded {model.name} on port {port} (PID={process.pid}, engine={engine_slot})"
             )
@@ -871,7 +881,7 @@ class LifecycleManager:
         except OSError:
             return False
 
-    def _build_env(self) -> dict:
+    def _build_env(self, launch_config: Optional[LaunchConfig] = None) -> dict:
         env = os.environ.copy()
         cuda_path = settings.cuda_path
         if cuda_path:
@@ -884,15 +894,128 @@ class LifecycleManager:
             # Prepending is idempotent in effect and cheap.
             env["PATH"] = f"{cuda_bin}{os.pathsep}{env.get('PATH', '')}"
         env["BONSAI_THINKING"] = "0"
+
+        # vLLM (Windows community wheel) specifics. Only applied to vLLM
+        # launches — the built-in binary/ternary llama engines get an
+        # untouched environment, so their behavior is never changed.
+        if launch_config is not None and launch_config.kind == "vllm":
+            # The engine log reader decodes these pipes as UTF-8
+            # (see _stream_output), but a Python child on a cp936 console
+            # writes GBK, so every Chinese engine line and every progress bar
+            # came through mojibake — and vLLM's APIServer raised
+            # UnicodeEncodeError inside its own logging. Same fix the d3 branch
+            # uses; unbuffered also keeps the GUI load progress live.
+            env.setdefault("PYTHONIOENCODING", "utf-8")
+            env.setdefault("PYTHONUNBUFFERED", "1")
+            # The wheel defaults to FlashInfer's top-p/top-k sampler, which
+            # JIT-compiles a CUDA extension with nvcc + MSVC (cl.exe) on the
+            # first run and aborts startup ("Cannot find compiler 'cl.exe'")
+            # when no MSVC toolchain is on PATH. Attention uses the prebuilt
+            # FlashAttention backend, and the PyTorch sampler is functionally
+            # equivalent for serving, so skip the FlashInfer sampler JIT.
+            env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+            # torch >= 2.10 turns AOT compile on by default. Its entry point
+            # does os.makedirs(VLLM_CACHE_ROOT/torch_compile_cache/...) from the
+            # EngineCore process, and on Windows that intermittently returns
+            # WinError 5 (the dir is being created/scanned elsewhere), which
+            # kills the engine mid-startup. The plain inductor cache still
+            # caches compiled graphs, so dropping AOT costs startup time only.
+            env.setdefault("VLLM_USE_AOT_COMPILE", "0")
+            # FlashInfer's JIT workspace defaults to ``%SystemDrive%\_fij``
+            # (C:\_fij). It must exist AND be writable at import time, and the
+            # long path can also exceed MAX_PATH. Put a flat ``_fij`` on the
+            # drive of the running workspace (D:) so it stays off C and the
+            # log file can never be locked by a system-drive install.
+            # vLLM's usage-telemetry file defaults to
+            # ``~/.config/vllm/usage_stats.json`` on C:. Both the APIServer and
+            # EngineCore append to it at the same moment, and the loser gets
+            # WinError 5 which aborts the engine. Opting out of telemetry kills
+            # that write entirely, and the config root moves to the workspace
+            # drive so anything else still written there stays off C.
+            env.setdefault("VLLM_NO_USAGE_STATS", "1")
+            env.setdefault("DO_NOT_TRACK", "1")
+            drive = os.path.splitdrive(os.getcwd())[0] or None
+            if drive:
+                vllm_cache = os.path.join(drive, os.sep, "_vllm_cache")
+                cache_dirs = [
+                    os.path.join(drive, os.sep, "_fij"),
+                    vllm_cache,
+                    os.path.join(vllm_cache, "inductor"),
+                    os.path.join(vllm_cache, "config"),
+                    # vllm/compilation/backends.py builds its torch.compile cache
+                    # under VLLM_CACHE_ROOT and mkdir's it from EngineCore; that
+                    # create intermittently comes back as WinError 5 on Windows,
+                    # which dynamo re-raises as BackendCompilerFailed and kills
+                    # the engine mid-startup. Pre-creating it here is the only
+                    # thing that avoids it — VLLM_USE_AOT_COMPILE=0 does not
+                    # cover this path (it only disables the AOT variant).
+                    os.path.join(vllm_cache, "torch_compile_cache"),
+                ]
+                env.setdefault("FLASHINFER_CACHE_DIR", cache_dirs[0])
+                # torch.compile / vLLM caches default to C:\Users\<user>\.cache\vllm.
+                # Keep them on the workspace drive so a near-full system drive
+                # cannot stall the first (uncached) compile.
+                env.setdefault("VLLM_CACHE_ROOT", vllm_cache)
+                env.setdefault("TORCHINDUCTOR_CACHE_DIR", cache_dirs[2])
+                env.setdefault("VLLM_CONFIG_ROOT", cache_dirs[3])
+                # vLLM spawns APIServer + EngineCore which import torch
+                # concurrently; two processes creating the same fresh path race
+                # on Windows and one gets WinError 5 (access denied) rather than
+                # the benign FileExistsError that exist_ok would absorb.
+                for d in cache_dirs:
+                    for attempt in range(3):
+                        try:
+                            os.makedirs(d, exist_ok=True)
+                            break
+                        except OSError as exc:
+                            if attempt == 2:
+                                logger.warning(
+                                    f"Could not pre-create vLLM cache dir {d}: {exc}"
+                                )
+                            else:
+                                time.sleep(0.2)
+            # Route any HuggingFace Hub lookups through the configured mirror.
+            hf_mirror = getattr(getattr(settings, "download", None), "hf_mirror", None)
+            if hf_mirror:
+                env.setdefault("HF_ENDPOINT", hf_mirror)
+
+        if launch_config is not None and launch_config.kind == "d3":
+            # d3_server.py is a plain Python process whose runtime prints
+            # progress bars and box-drawing banners. On a Chinese Windows
+            # console (cp936) that raises UnicodeEncodeError inside logging and
+            # the whole startup dies on a cosmetic print, so force UTF-8 and
+            # unbuffered output — the latter matters because the GUI shows the
+            # load progress live.
+            env.setdefault("PYTHONIOENCODING", "utf-8")
+            env.setdefault("PYTHONUNBUFFERED", "1")
+            drive = os.path.splitdrive(os.getcwd())[0] or None
+            if drive:
+                # Triton (used by flash-linear-attention's gated-deltanet
+                # kernels) caches under ~/.triton on the system drive; keep the
+                # build off a near-full C: like every other GPU engine here.
+                triton_cache = os.path.join(drive, os.sep, "_d3_cache", "triton")
+                try:
+                    os.makedirs(triton_cache, exist_ok=True)
+                    env.setdefault("TRITON_CACHE_DIR", triton_cache)
+                except OSError as exc:
+                    logger.warning(f"Could not pre-create d3 triton cache {triton_cache}: {exc}")
+            hf_mirror = getattr(getattr(settings, "download", None), "hf_mirror", None)
+            if hf_mirror:
+                env.setdefault("HF_ENDPOINT", hf_mirror)
         return env
 
     async def _wait_for_health(self, instance: ModelInstance) -> bool:
         # Per-engine-slot configurable timeout (settings.engines.<slot>.startup_timeout)
         slot = instance.launch_config.engine_slot
-        try:
-            timeout = int(getattr(getattr(settings.engines, slot), "startup_timeout", 120))
-        except Exception:
-            timeout = 120
+        slot_cfg = getattr(settings.engines, slot, None)
+        if slot_cfg is not None:
+            timeout = int(slot_cfg.startup_timeout)
+        else:
+            # Discovered/custom engines (vLLM, ...): cold start includes model
+            # loading + torch.compile cache build + CUDA graph capture and can
+            # run well past 120s on the first load. This branch never applies
+            # to primary/ternary, which have slot configs.
+            timeout = 900
         url = f"{instance.base_url}/health"
         start = time.time()
 
@@ -913,6 +1036,24 @@ class LifecycleManager:
 
         logger.error(f"Health check timed out after {timeout}s for port {instance.launch_config.port}")
         return False
+
+    async def _read_d3_contract(self, instance: ModelInstance) -> None:
+        """Ask a d3 server what it can actually do (modalities and limits).
+
+        The package derives this from its own weights (vision tower present or
+        not, kernel availability), so reading it beats guessing from files, and
+        the GUI shows it instead of an empty chat box.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+                resp = await client.get(f"{instance.base_url}/v1/models")
+                if resp.status_code != 200:
+                    return
+                models = (resp.json() or {}).get("models") or []
+                if models:
+                    instance.system_one = models[0]
+        except Exception as e:  # noqa: BLE001 - a missing contract is cosmetic
+            logger.debug(f"Could not read d3 contract: {e}")
 
     async def _kill_process(self, process: asyncio.subprocess.Process):
         if process.returncode is not None:

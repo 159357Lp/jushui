@@ -32,6 +32,42 @@ ENGINE_KINDS: dict[str, dict] = {
         "formats": [".engine"],
         "args_template": "--model {model} --port {port} --host {host}",
     },
+    "vllm": {
+        "label": "vLLM (HuggingFace / Safetensors)",
+        # pip entry point: vllm.exe (Windows) / vllm (Linux) in the env's
+        # Scripts directory. Add that directory to the engine scan dirs.
+        "binary_names": ["vllm.exe", "vllm"],
+        # Only .safetensors / HF model directories. GGUF/GGML are deliberately
+        # NOT claimed here so the built-in primary (binary) and ternary engines
+        # keep handling every GGUF model.
+        "formats": [".safetensors"],
+        # Uses a `serve` subcommand with a positional model (dir) path; the arg
+        # list is built directly in router (like llama), so no template here.
+        "args_template": None,
+    },
+    "d3": {
+        "label": "Decision 3.0 (System One 决策模型)",
+        # A d3 package ships its own server script (d3_server.py, standard
+        # library HTTP) and is run as `python <pkg>/d3_server.py ...`, so the
+        # "binary" is a Python interpreter and the script becomes arg #1. Any
+        # venv containing python.exe on the engine scan dirs qualifies.
+        "binary_names": ["python.exe", "python"],
+        # Directory-signature based (MODEL_MANIFEST.json), not extension based:
+        # claiming .safetensors here would fight vLLM over every HF dir.
+        "formats": [],
+        "args_template": None,
+    },
+    "d3-gguf": {
+        "label": "llama.cpp d3 GGUF 决策引擎",
+        # A decision model compiled to GGUF is identified by its
+        # `<arch>.decision.type` metadata, not by its extension, so this kind
+        # deliberately claims no formats and no scan-dir binaries: it never
+        # hijacks an ordinary GGUF model and can only be added as a custom
+        # engine. The launch args are the ordinary llama set (built in router).
+        "binary_names": [],
+        "formats": [],
+        "args_template": None,
+    },
 }
 
 

@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 
+from lmloader import __version__
 from lmloader.api.security import (
     SecurityHeadersMiddleware,
     TokenAuthMiddleware,
@@ -99,7 +100,7 @@ def _emit_startup_banner():
     host = settings.server.host
     port = settings.server.port
     base = f"http://{host}:{port}"
-    event_log.info("server", f"LM Loader server listening on {base}")
+    event_log.info("server", f"掬水 server listening on {base}")
     if getattr(settings.server, "api_token", ""):
         event_log.info("server", "  鉴权已启用：所有请求需带 Authorization: Bearer <token>")
     else:
@@ -136,6 +137,7 @@ def _emit_startup_banner():
         ("POST", "/api/models/switch"),
         ("POST", "/api/models/vision"),
         ("POST", "/api/models/scan"),
+        ("POST", "/v1/systemone"),
     ):
         event_log.info("server", f"   {method:4} {base}{path}")
     event_log.info("server", f"Logs are saved into {Path.cwd() / 'logs'}")
@@ -143,9 +145,9 @@ def _emit_startup_banner():
 
 
 app = FastAPI(
-    title="LM Loader",
+    title="掬水",
     description="Desktop model loader powered by llama-server",
-    version="0.2.0",
+    version=__version__,
     lifespan=lifespan,
 )
 
@@ -279,7 +281,7 @@ async def root():
     index_path = static_dir / "index.html"
     if index_path.exists():
         return index_path.read_text(encoding="utf-8")
-    return "<h1>LM Loader</h1><p>API running. Visit /docs for API documentation.</p>"
+    return "<h1>掬水</h1><p>API running. Visit /docs for API documentation.</p>"
 
 
 @app.get("/health")

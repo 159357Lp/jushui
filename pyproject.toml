@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lmloader"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Desktop model loader with multi-backend routing"
 requires-python = ">=3.10"
 dependencies = [
@@ -29,6 +29,9 @@ lmloader-gui = "lmloader.gui.main:main"
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]  # FIXED: T1
+
+[tool.setuptools.dynamic]
+version = { attr = "lmloader.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["lmloader*"]

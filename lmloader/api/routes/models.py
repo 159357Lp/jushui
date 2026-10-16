@@ -53,6 +53,27 @@ from lmloader.engine.router import (
 )
 
 
+def _annotate_vision(d: dict, model) -> None:
+    """Fill in the vision fields, from the right source for each engine.
+
+    llama.cpp models get vision from a side-car ``mmproj*.gguf``. A Decision 3.0
+    package has its vision tower inside its own weights and accepts media in the
+    request body, so it has no mmproj and must be read off the checkpoint.
+    """
+    d["is_vision"] = engine_router.is_vision_encoder(model)
+    decision = engine_router.is_d3_package(model)
+    # A decision-type GGUF (``<arch>.decision.type``) is also not a chat model:
+    # llama.cpp serves it on /v1/systemone only. Marked from the metadata the
+    # parser already read, so nothing is guessed about its modalities.
+    d["is_decision_model"] = decision or bool(
+        (model.metadata or {}).get("decision_type"))
+    if decision:
+        d["modalities"] = engine_router.d3_modalities(model)
+        d["has_vision"] = "image" in d["modalities"]
+        return
+    d["has_vision"] = not d["is_vision"] and engine_router.find_mmproj(model) is not None
+
+
 def _defaults_for_engine_slot(model) -> dict:
     """Engine-slot defaults, used as the baseline when no run config is saved."""
     from lmloader.config import settings as cfg
@@ -124,8 +145,7 @@ async def list_models(status: Optional[str] = None):
     items = []
     for m in models:
         d = m.to_dict()
-        d["is_vision"] = engine_router.is_vision_encoder(m)
-        d["has_vision"] = not d["is_vision"] and engine_router.find_mmproj(m) is not None
+        _annotate_vision(d, m)
         d["has_run_config"] = m.name in saved_names
         items.append(d)
     return {"models": items}
@@ -143,8 +163,7 @@ async def get_model(model_id: int):
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
     d = model.to_dict()
-    d["is_vision"] = engine_router.is_vision_encoder(model)
-    d["has_vision"] = not d["is_vision"] and engine_router.find_mmproj(model) is not None
+    _annotate_vision(d, model)
     return d
 
 
