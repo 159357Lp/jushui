@@ -1,6 +1,6 @@
 # LM Loader
 
-**桌面端 AI 模型加载器** — 平替 Ollama + LM Studio，集成三进制 llama-server 引擎
+**桌面端 AI 模型加载器** — 平替 Ollama + LM Studio，多引擎自动路由（三进制 llama.cpp / vLLM / Decision 3.0）
 
 > 版本：**v0.2.0**（单一版本源：`lmloader/__init__.py` 中的 `__version__`，GUI、API、包元数据均从此读取）
 
@@ -50,13 +50,13 @@ LM Loader 是一个**独立的桌面模型管理工具**，不是任何外部服
 
 - **替代 Ollama**：提供模型下载、仓库管理、Ollama 兼容 API、守护进程常驻
 - **替代 LM Studio**：提供图形化聊天工作台、模型下载中心、设置面板、资源监控
-- **集成三进制引擎**：内置 llama-server（含三进制版），在同一个工具内完成 模型下载 → 加载 → 对话 → 卸载 全流程
+- **集成多引擎**：内置三进制 llama.cpp，并可挂载 vLLM、Decision 3.0 等引擎，在同一个工具内完成 模型下载 → 加载 → 对话 → 卸载 全流程，按模型格式自动路由到正确的引擎
 
 ## 核心特性
 
 ### 引擎层
-- **双引擎注册表**：primary 引擎（标准 GGUF）+ ternary 引擎（三进制模型）
-- **自动路由**：按 GGUF 量化类型自动选择引擎（PQ2_0_TERNARY/TL1/TL2 → ternary 引擎）
+- **多引擎注册表**：primary（标准 GGUF）+ ternary（三进制）+ vLLM（HF/safetensors 目录）+ d3（Decision 3.0 包，Python `d3_server.py`）+ d3-gguf（llama.cpp 决策 GGUF，自定义引擎）
+- **自动路由**：按模型格式/量化类型自动选择引擎——三进制量化（PQ2_0_TERNARY/TL1/TL2）→ ternary；GGUF 决策类型（如 vllm-d3）→ d3-gguf；Decision 3.0 包目录 → d3；HF config.json+safetensors 目录 → vLLM；其余标准 GGUF → primary
 - **守护进程**：服务常驻，优雅启停
 - **端口管理**：自动分配可用端口
 
@@ -220,9 +220,9 @@ curl http://localhost:8900/api/chat \
 │ 应用服务层                                            │
 │  模型注册表 (SQLite) · 会话管理 · 配置中心               │
 ├──────────────────────────────────────────────────────┤
-│ 引擎层 (核心：引擎注册表 + 自动选择)                  │
-│  引擎注册表: primary 引擎 + ternary 引擎               │
-│  选择器: 按 GGUF 量化类型/架构 路由到正确引擎          │
+│ 引擎层 (核心：多引擎注册表 + 自动路由)                │
+│  引擎: primary · ternary · vLLM · d3 · d3-gguf         │
+│  选择器: 按模型格式/量化类型/决策类型 路由到正确引擎   │
 │  进程管理: 守护常驻 · 优雅启停 · 端口分配                  │
 ├──────────────────────────────────────────────────────┤
 │ 基础设施层                                            │
@@ -233,10 +233,13 @@ curl http://localhost:8900/api/chat \
 
 ## 引擎路由规则
 
-| 量化类型 | 引擎 |
+| 模型类型 / 量化 | 引擎 |
 |---------|------|
-| Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ2_XXS, IQ3_XXS 等标准类型 | primary |
+| Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ2_XXS, IQ3_XXS 等标准 GGUF | primary |
 | PQ2_0_TERNARY, TL1_TERNARY, TL2_TERNARY, TQ1_0, TQ2_0, I2_S, TL1, TL2 | ternary |
+| GGUF 声明决策类型（`<arch>.decision.type`，如 `vllm-d3`） | d3-gguf（自定义引擎 d3-master） |
+| Decision 3.0 包目录（`MODEL_MANIFEST.json` + `d3_server.py`，System One 决策模型） | d3（venv 内 python.exe） |
+| HuggingFace 目录（`config.json` + `*.safetensors`） | vLLM |
 
 路由结果在前端和 CLI 中明确展示，用户随时知道模型跑在哪个引擎上。
 
@@ -274,6 +277,7 @@ black lmloader/
 ## 更新日志
 
 **v0.2.0**
+- 引擎从「双引擎」扩展为**多引擎自动路由**：新增 vLLM（HF/safetensors 目录）、d3（Decision 3.0 包，走 `/v1/systemone`）、d3-gguf（llama.cpp 决策 GGUF，自定义引擎），按模型格式/量化/决策类型自动选择
 - 聊天输入框上方新增模型下拉切换器：列出全部模型，选中未加载模型自动后台拉起，无需切换页面
 - GUI 冷启动优化：`infra` 包改为惰性导入，窗口 import 耗时 545ms → 297ms
 - 空闲 CPU 占用修复：httpx 连接池复用，空闲时 CPU 35% → 0.4%
