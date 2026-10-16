@@ -43,16 +43,31 @@ async def _get_run_config_sync(model_name: str) -> Optional[dict]:
         return None
 
 
+def is_decision_model(model: ModelRecord, engine_kind: str) -> bool:
+    """True for either shape of decision model: a d3 package (kind "d3") or a
+    decision-type GGUF. The GGUF variant resolves with kind "llama" (see
+    router.resolve_engine), so its ``decision_type`` metadata is the only mark.
+    """
+    return engine_kind == "d3" or bool(
+        (getattr(model, "metadata", None) or {}).get("decision_type"))
+
+
 class ModelInstance:
     def __init__(
         self,
         model: ModelRecord,
         process: asyncio.subprocess.Process,
         launch_config: LaunchConfig,
+        pinned: bool = False,
     ):
         self.model = model
         self.process = process
         self.launch_config = launch_config
+        # Decision models are resident infrastructure (served on
+        # /v1/systemone, slow to cold-start): automatic eviction paths —
+        # switch bulk-unload and the idle watchdog — must never take them.
+        # Explicit user unload and backend shutdown still do.
+        self.pinned = pinned
         self.base_url = f"http://{launch_config.host}:{launch_config.port}"  # FIXED: B5
         self.started_at = time.time()
         # Last time this instance served a request; drives idle auto-unload.
@@ -100,6 +115,7 @@ class ModelInstance:
             "port": self.launch_config.port,
             "engine_slot": self.launch_config.engine_slot,
             "engine_kind": self.launch_config.kind,
+            "pinned": self.pinned,
             "system_one": self.system_one,
             "base_url": self.base_url,
             "api_base": f"{self.base_url}/v1",
@@ -373,31 +389,40 @@ class LifecycleManager:
                 limit = getattr(settings.router, "idle_unload_minutes", 0) or 0
                 if limit <= 0:
                     continue
-                async with self._lock:
-                    names = list(self.instances.keys())
-                    for name in names:
-                        inst = self.instances.get(name)
-                        if not inst:
-                            continue
-                        if inst.idle_minutes() >= limit:
-                            mins = int(inst.idle_minutes())
-                            logger.info(
-                                f"Auto-unloading idle model {name} "
-                                f"(idle {mins}m >= {limit}m)"
-                            )
-                            event_log.info(
-                                "lifecycle",
-                                f"模型 {name} 已空闲 {mins} 分钟，自动卸载释放显存",
-                                model=name, idle_minutes=mins,
-                            )
-                            try:
-                                await self._unload_model_locked(name)
-                            except Exception as e:  # noqa: BLE001
-                                logger.error(f"idle unload failed for {name}: {e}")
+                await self._idle_sweep_once(limit)
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"idle watchdog error: {e}")
+
+    async def _idle_sweep_once(self, limit: int) -> None:
+        """Unload instances idle past ``limit`` minutes; pinned ones survive.
+
+        A decision model sits idle between /v1/systemone calls by design —
+        evicting it would punish exactly the workloads that keep it resident
+        for snappy decisions (d3 cold start runs Python + triton compile).
+        """
+        async with self._lock:
+            names = list(self.instances.keys())
+            for name in names:
+                inst = self.instances.get(name)
+                if not inst or inst.pinned:
+                    continue
+                if inst.idle_minutes() >= limit:
+                    mins = int(inst.idle_minutes())
+                    logger.info(
+                        f"Auto-unloading idle model {name} "
+                        f"(idle {mins}m >= {limit}m)"
+                    )
+                    event_log.info(
+                        "lifecycle",
+                        f"模型 {name} 已空闲 {mins} 分钟，自动卸载释放显存",
+                        model=name, idle_minutes=mins,
+                    )
+                    try:
+                        await self._unload_model_locked(name)
+                    except Exception as e:  # noqa: BLE001
+                        logger.error(f"idle unload failed for {name}: {e}")
 
     async def load_model(
         self,
@@ -430,7 +455,7 @@ class LifecycleManager:
                 return False
 
             if not keep_previous and settings.router.auto_unload_on_switch:
-                await self._unload_all_locked()
+                await self._unload_all_locked(keep_pinned=True)
 
             # Fail fast with a clear message when the weights file is gone
             # (e.g. Ollama was uninstalled, taking its blob store with it).
@@ -520,7 +545,10 @@ class LifecycleManager:
                 self._used_ports.discard(port)
                 return False
 
-            instance = ModelInstance(model, process, launch_config)
+            instance = ModelInstance(
+                model, process, launch_config,
+                pinned=is_decision_model(model, engine_kind),
+            )
             instance.start_stderr_reader()
 
             # Bind the engine to the kill-on-close job object BEFORE the health
@@ -571,6 +599,8 @@ class LifecycleManager:
             if launch_config.kind == "d3":
                 modalities = "/".join((instance.system_one or {}).get("modalities") or [])
                 vision_part = f"，决策模型（模态：{modalities or 'text'}，走 /v1/systemone）"
+            if instance.pinned:
+                vision_part += "，已钉选：模型切换与闲置均不自动卸载"
             logger.info(
                 f"Loaded {model.name} on port {port} (PID={process.pid}, engine={engine_slot})"
             )
@@ -649,9 +679,15 @@ class LifecycleManager:
         # Force kill
         await self._kill_process(instance.process)
 
-    async def unload_all(self):
+    async def unload_all(self, keep_pinned: bool = False):
+        """Unload every instance.
+
+        keep_pinned=False (the default) is for teardown paths — backend
+        shutdown, engine hot-swap that must release exe/dll file locks — where
+        nothing may stay resident. Automatic-switch callers pass True.
+        """
         async with self._lock:
-            await self._unload_all_locked()
+            await self._unload_all_locked(keep_pinned=keep_pinned)
 
     async def set_vision(self, model_name: str, enabled: bool) -> bool:
         """Toggle the vision encoder on a loaded model.
@@ -691,10 +727,14 @@ class LifecycleManager:
             await self.load_model(model, keep_previous=False, vision_enabled=currently)
         return ok
 
-    async def _unload_all_locked(self):
+    async def _unload_all_locked(self, keep_pinned: bool = False):
         names = list(self.instances.keys())
         failed: list[str] = []
         for name in names:
+            inst = self.instances.get(name)
+            if keep_pinned and inst is not None and inst.pinned:
+                logger.info(f"Keeping pinned decision model {name} resident through switch")
+                continue
             # One model failing to unload must not strand the rest. Previously a
             # single exception here aborted the whole loop, leaving every
             # later model resident in VRAM after a shutdown/switch.
@@ -726,7 +766,7 @@ class LifecycleManager:
         keep_previous: bool = False,
     ) -> bool:
         if not keep_previous:
-            await self.unload_all()
+            await self.unload_all(keep_pinned=True)
         return await self.load_model(target_model, keep_previous=keep_previous)
 
     async def _reap_dead_instances(self) -> list[str]:
