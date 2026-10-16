@@ -117,8 +117,8 @@ def main():
     backend_proc = _ensure_backend()
 
     from lmloader.gui.styles import apply_theme
-    from lmloader.gui.window import _load_theme_from_config
-    apply_theme(app, _load_theme_from_config())
+    from lmloader.gui.ui_config import load_theme_from_config
+    apply_theme(app, load_theme_from_config())
 
     from lmloader.gui.window import MainWindow
     window = MainWindow()

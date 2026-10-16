@@ -21,55 +21,11 @@ from lmloader.gui.pages.monitor import MonitorPage
 from lmloader.gui.pages.logs import LogsPage
 from lmloader.gui.styles import apply_theme, c as theme_color
 from lmloader.gui.icons import app_icon
+from lmloader.gui.ui_config import load_ui_setting, save_ui_setting
 
 
 SIDEBAR_WIDTH_EXPANDED = 200
 SIDEBAR_WIDTH_COLLAPSED = 52
-
-
-def _config_path():
-    from pathlib import Path
-    for candidate in (Path("config.yaml"), Path.home() / ".lmloader" / "config.yaml"):
-        if candidate.exists():
-            return candidate
-    return Path("config.yaml")
-
-
-def _load_ui_setting(key: str, default):
-    try:
-        import yaml
-        cfg = yaml.safe_load(_config_path().read_text(encoding="utf-8")) or {}
-        return (cfg.get("ui") or {}).get(key, default)
-    except Exception:
-        return default
-
-
-def _save_ui_setting(key: str, value):
-    """Persist one ui.* key into config.yaml without touching other sections."""
-    try:
-        import yaml
-        path = _config_path()
-        cfg = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
-        cfg = cfg or {}
-        ui = cfg.get("ui") or {}
-        ui[key] = value
-        cfg["ui"] = ui
-        path.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
-    except Exception:
-        pass
-
-
-def _load_theme_from_config() -> str:
-    try:
-        import yaml
-        from pathlib import Path
-        for candidate in (Path("config.yaml"), Path.home() / ".lmloader" / "config.yaml"):
-            if candidate.exists():
-                cfg = yaml.safe_load(candidate.read_text(encoding="utf-8")) or {}
-                return (cfg.get("ui") or {}).get("theme", "dark")
-    except Exception:
-        pass
-    return "dark"
 
 
 class MainWindow(QMainWindow):
@@ -87,7 +43,7 @@ class MainWindow(QMainWindow):
 
         self.api = LMLoaderAPI()
         self._connection_check_running = False
-        self._collapsed = bool(_load_ui_setting("sidebar_collapsed", False))
+        self._collapsed = bool(load_ui_setting("sidebar_collapsed", False))
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -283,7 +239,11 @@ class MainWindow(QMainWindow):
     def _toggle_sidebar(self):
         self._collapsed = not self._collapsed
         self._apply_sidebar_state()
-        _save_ui_setting("sidebar_collapsed", self._collapsed)
+        try:
+            save_ui_setting("sidebar_collapsed", self._collapsed)
+        except Exception:
+            # A read-only config.yaml must not break collapsing the rail.
+            pass
 
     def _apply_sidebar_state(self):
         collapsed = self._collapsed

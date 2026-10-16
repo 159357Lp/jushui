@@ -25,6 +25,7 @@ from lmloader.gui.icons import copy_icon, download_icon
 from lmloader.gui.i18n import tr
 from lmloader.gui.repetition import detect_repetition_loop
 from lmloader.gui.styles import c
+from lmloader.gui.ui_config import load_ui_setting, save_ui_setting
 from lmloader.infra.chat_db import chat_db
 
 
@@ -213,6 +214,9 @@ class ChatPage(QWidget):
         self._message_rows: list[QWidget] = []
         self._rendered_conv: dict | None = None
         self._attachments: list[dict] = []   # {"name", "path", "text"}
+        # System prompt panel state. _prompt_syncing guards the programmatic
+        # setText() path (switching conversations) from re-triggering a save.
+        self._prompt_syncing = False
         self._init_ui()
         self._stream_render_timer = QTimer(self)
         self._stream_render_timer.setInterval(100)
@@ -226,6 +230,10 @@ class ChatPage(QWidget):
         self._stats_timer = QTimer(self)
         self._stats_timer.setInterval(750)
         self._stats_timer.timeout.connect(self._poll_generation_stats)
+        self._prompt_save_timer = QTimer(self)
+        self._prompt_save_timer.setSingleShot(True)
+        self._prompt_save_timer.setInterval(600)
+        self._prompt_save_timer.timeout.connect(self._persist_prompt)
         self._load_models()
         self._init_chat_db()
 
@@ -356,6 +364,31 @@ class ChatPage(QWidget):
         top_bar.addStretch()
         layout.addLayout(top_bar)
 
+        # 系统提示词摘要条：面板收起时也始终看得见模型被交代了什么。
+        self.prompt_bar = QFrame()
+        self.prompt_bar.setObjectName("chatPromptBar")
+        self.prompt_bar.setStyleSheet(
+            f"QFrame#chatPromptBar {{ background: {c('accent_soft')};"
+            f" border: 1px solid {c('accent_border')}; border-radius: 8px; }}"
+            " QFrame#chatPromptBar QLabel { background: transparent; }"
+        )
+        bar_layout = QHBoxLayout(self.prompt_bar)
+        bar_layout.setContentsMargins(10, 5, 8, 5)
+        bar_layout.setSpacing(8)
+        bar_title = QLabel(tr("chat.prompt_title"))
+        bar_title.setStyleSheet(f"color: {c('accent')}; font-size: 12px; font-weight: 600;")
+        bar_layout.addWidget(bar_title)
+        self.prompt_bar_preview = QLabel("")
+        self.prompt_bar_preview.setStyleSheet(f"color: {c('muted')}; font-size: 12px;")
+        bar_layout.addWidget(self.prompt_bar_preview, 1)
+        bar_edit = QPushButton(tr("chat.prompt_edit"))
+        bar_edit.setCursor(Qt.PointingHandCursor)
+        bar_edit.setStyleSheet(self._mini_action_qss())
+        bar_edit.clicked.connect(self._open_prompt_panel)
+        bar_layout.addWidget(bar_edit)
+        self.prompt_bar.setVisible(False)
+        layout.addWidget(self.prompt_bar)
+
         self.chat_scroll = QScrollArea()
         self.chat_scroll.setObjectName("chatDisplay")
         self.chat_scroll.setWidgetResizable(True)
@@ -425,6 +458,14 @@ class ChatPage(QWidget):
         self.thinking_btn.setCursor(Qt.PointingHandCursor)
         self.thinking_btn.toggled.connect(self._on_thinking_toggled)
         toolbar.addWidget(self.thinking_btn)
+
+        self.prompt_btn = QPushButton(tr("chat.prompt"))
+        self.prompt_btn.setCheckable(True)
+        self.prompt_btn.setCursor(Qt.PointingHandCursor)
+        self.prompt_btn.setToolTip(tr("chat.prompt_tip"))
+        self.prompt_btn.setStyleSheet(self._prompt_chip_qss())
+        self.prompt_btn.toggled.connect(self._on_prompt_panel_toggled)
+        toolbar.addWidget(self.prompt_btn)
         toolbar.addStretch()
         input_hint = QLabel(tr("chat.input_hint"))
         input_hint.setStyleSheet(f"color: {c('muted')}; font-size: 11px;")
@@ -441,6 +482,9 @@ class ChatPage(QWidget):
         self.attach_bar.setVisible(False)
         composer_layout.addWidget(self.attach_bar)
         self._update_thinking_btn()
+
+        self._prompt_panel = self._build_prompt_panel()
+        composer_layout.addWidget(self._prompt_panel)
 
         bottom = QHBoxLayout()
         bottom.setContentsMargins(0, 0, 0, 0)
@@ -552,6 +596,247 @@ class ChatPage(QWidget):
                 " padding: 3px 14px; font-size: 12px; }"
             )
             btn.setToolTip(tr("chat.thinking_off_tip"))
+
+    # ------------------------------------------------------------ system prompt
+
+    @staticmethod
+    def _prompt_chip_qss() -> str:
+        return (
+            f"QPushButton {{ color: {c('muted')}; background: transparent;"
+            f" border: 1px solid {c('chip_border')}; border-radius: 12px;"
+            " padding: 3px 12px; font-size: 12px; }"
+            f" QPushButton:hover {{ color: {c('accent')}; background: {c('accent_soft')};"
+            f" border-color: {c('accent_border')}; }}"
+            f" QPushButton:checked {{ color: {c('accent')}; background: {c('accent_soft')};"
+            f" border-color: {c('accent_border')}; }}"
+            f' QPushButton[has="true"] {{ color: {c("green")};'
+            f" border-color: {c('green')}66; }}"
+        )
+
+    def _prompt_templates(self) -> list[tuple[str, str]]:
+        return [
+            (tr("chat.prompt_tpl1_name"), tr("chat.prompt_tpl1_body")),
+            (tr("chat.prompt_tpl2_name"), tr("chat.prompt_tpl2_body")),
+            (tr("chat.prompt_tpl3_name"), tr("chat.prompt_tpl3_body")),
+        ]
+
+    def _build_prompt_panel(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("chatPromptPanel")
+        panel.setStyleSheet(
+            f"QFrame#chatPromptPanel {{ background: {c('bg')};"
+            f" border: 1px solid {c('accent_border')}; border-radius: 10px; }}"
+            " QFrame#chatPromptPanel QLabel { background: transparent; }"
+        )
+        box = QVBoxLayout(panel)
+        box.setContentsMargins(10, 8, 10, 8)
+        box.setSpacing(6)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        title = QLabel(tr("chat.prompt_title"))
+        title.setStyleSheet(f"color: {c('accent')}; font-size: 12px; font-weight: 600;")
+        head.addWidget(title)
+
+        self.prompt_scope = QComboBox()
+        self.prompt_scope.setCursor(Qt.PointingHandCursor)
+        self.prompt_scope.setToolTip(tr("chat.prompt_scope_tip"))
+        self.prompt_scope.addItem(tr("chat.prompt_scope_conv"), "conv")
+        self.prompt_scope.addItem(tr("chat.prompt_scope_global"), "global")
+        self.prompt_scope.currentIndexChanged.connect(self._on_prompt_scope_changed)
+        head.addWidget(self.prompt_scope)
+
+        self.prompt_tpl = QComboBox()
+        self.prompt_tpl.setCursor(Qt.PointingHandCursor)
+        self.prompt_tpl.setToolTip(tr("chat.prompt_tpl_tip"))
+        self.prompt_tpl.addItem(tr("chat.prompt_template"), "")
+        for name, body in self._prompt_templates():
+            self.prompt_tpl.addItem(name, body)
+        self.prompt_tpl.activated.connect(self._on_template_chosen)
+        head.addWidget(self.prompt_tpl)
+
+        head.addStretch()
+        clear_btn = QPushButton(tr("chat.prompt_clear"))
+        clear_btn.setCursor(Qt.PointingHandCursor)
+        clear_btn.setStyleSheet(self._mini_action_qss())
+        clear_btn.clicked.connect(self._clear_prompt)
+        head.addWidget(clear_btn)
+        close_btn = QPushButton(tr("chat.prompt_collapse"))
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setStyleSheet(self._mini_action_qss())
+        close_btn.clicked.connect(lambda: self.prompt_btn.setChecked(False))
+        head.addWidget(close_btn)
+        box.addLayout(head)
+
+        self.prompt_box = QTextEdit()
+        self.prompt_box.setObjectName("chatPromptBox")
+        self.prompt_box.setPlaceholderText(tr("chat.prompt_placeholder"))
+        self.prompt_box.setMinimumHeight(76)
+        self.prompt_box.setMaximumHeight(150)
+        self.prompt_box.setStyleSheet(
+            f"QTextEdit#chatPromptBox {{ background: {c('surface')};"
+            f" border: 1px solid {c('border')}; border-radius: 8px;"
+            f" color: {c('fg')}; font-size: 13px; padding: 6px 8px; }}"
+            f" QTextEdit#chatPromptBox:focus {{ border-color: {c('accent')}; }}"
+        )
+        self.prompt_box.textChanged.connect(self._on_prompt_text_changed)
+        box.addWidget(self.prompt_box)
+
+        foot = QHBoxLayout()
+        foot.setSpacing(10)
+        self.prompt_count = QLabel("")
+        self.prompt_count.setStyleSheet(f"color: {c('fg')}; font-size: 11px;")
+        foot.addWidget(self.prompt_count)
+        self.prompt_state = QLabel("")
+        self.prompt_state.setStyleSheet(f"color: {c('muted')}; font-size: 11px;")
+        foot.addWidget(self.prompt_state)
+        foot.addStretch()
+        hint = QLabel(tr("chat.prompt_inject_hint"))
+        hint.setStyleSheet(f"color: {c('dim')}; font-size: 11px;")
+        foot.addWidget(hint)
+        box.addLayout(foot)
+
+        panel.setVisible(False)
+        return panel
+
+    def _current_conv(self) -> dict | None:
+        if self.current_conv_id is None:
+            return None
+        if not (0 <= self.current_conv_id < len(self.conversations)):
+            return None
+        return self.conversations[self.current_conv_id]
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Rough token count for the footer: CJK ≈ 1 token/char, ASCII ≈ 4 chars/token."""
+        if not text:
+            return 0
+        cjk = sum(1 for ch in text if ord(ch) > 0x2E80)
+        other = len(text) - cjk
+        return cjk + max(1, other // 4) if other else cjk
+
+    def _open_prompt_panel(self):
+        self.prompt_btn.setChecked(True)
+        self.prompt_box.setFocus()
+
+    def _on_prompt_panel_toggled(self, checked: bool):
+        if not hasattr(self, "_prompt_panel"):
+            return
+        self._prompt_panel.setVisible(checked)
+        if checked:
+            self._apply_scope_from_conv()
+        self._refresh_prompt_ui()
+
+    def _on_template_chosen(self, index: int):
+        body = self.prompt_tpl.itemData(index)
+        if body is None:
+            return
+        self.prompt_box.setPlainText(body)
+        self.prompt_tpl.setCurrentIndex(0)
+
+    def _clear_prompt(self):
+        self.prompt_box.clear()
+        self.prompt_box.setFocus()
+
+    def _on_prompt_text_changed(self):
+        if self._prompt_syncing:
+            return
+        conv = self._current_conv()
+        if conv is not None:
+            conv["system_prompt"] = self.prompt_box.toPlainText()
+        self._refresh_prompt_ui()
+        self._prompt_save_timer.start()
+
+    def _on_prompt_scope_changed(self, _index: int):
+        if self._prompt_syncing:
+            return
+        text = self.prompt_box.toPlainText()
+        mode = self.prompt_scope.currentData()
+        try:
+            if mode == "global":
+                save_ui_setting("system_prompt", text)
+            elif str(load_ui_setting("system_prompt", "") or "") == text:
+                # Only un-set the global default when it is this same text, so
+                # switching back never clobbers an unrelated default.
+                save_ui_setting("system_prompt", "")
+        except Exception as exc:
+            self._prompt_state_error(str(exc))
+            return
+        self._refresh_prompt_ui()
+
+    def _prompt_state_error(self, err: str):
+        self.prompt_state.setText(tr("chat.prompt_save_fail").format(err=err))
+        self.prompt_state.setStyleSheet(f"color: {c('warn')}; font-size: 11px;")
+
+    def _apply_scope_from_conv(self):
+        conv = self._current_conv()
+        text = (conv or {}).get("system_prompt", "") if conv else ""
+        glob = str(load_ui_setting("system_prompt", "") or "")
+        idx = 1 if (text and glob and text.strip() == glob.strip()) else 0
+        self._prompt_syncing = True
+        self.prompt_scope.setCurrentIndex(idx)
+        self._prompt_syncing = False
+
+    def _apply_prompt_to_ui(self):
+        """Reflect the current conversation's prompt into the panel and bar."""
+        if not hasattr(self, "prompt_box"):
+            return
+        conv = self._current_conv()
+        text = (conv or {}).get("system_prompt", "") if conv else ""
+        self._prompt_syncing = True
+        self.prompt_box.setPlainText(text)
+        self._prompt_syncing = False
+        self._apply_scope_from_conv()
+        self._refresh_prompt_ui()
+
+    def _refresh_prompt_ui(self):
+        conv = self._current_conv()
+        text = (conv or {}).get("system_prompt", "") if conv else ""
+        if not self._prompt_syncing:
+            text = self.prompt_box.toPlainText()
+        has = bool(text.strip())
+        mode = self.prompt_scope.currentData() or "conv"
+
+        self.prompt_btn.setText(
+            f"{tr('chat.prompt')} · {tr('chat.prompt_scope_global') if mode == 'global' else tr('chat.prompt_scope_conv')}"
+            if has else tr("chat.prompt")
+        )
+        self.prompt_btn.setProperty("has", has)
+        self.prompt_btn.style().unpolish(self.prompt_btn)
+        self.prompt_btn.style().polish(self.prompt_btn)
+
+        chars = len(text)
+        self.prompt_count.setText(
+            tr("chat.prompt_count").format(chars=chars, tok=self._estimate_tokens(text))
+        )
+        if not has:
+            self.prompt_state.setText(tr("chat.prompt_state_none"))
+            self.prompt_state.setStyleSheet(f"color: {c('muted')}; font-size: 11px;")
+        elif mode == "global":
+            self.prompt_state.setText(tr("chat.prompt_state_global"))
+            self.prompt_state.setStyleSheet(f"color: {c('green')}; font-size: 11px;")
+        else:
+            self.prompt_state.setText(tr("chat.prompt_state_conv"))
+            self.prompt_state.setStyleSheet(f"color: {c('muted')}; font-size: 11px;")
+
+        self.prompt_bar.setVisible(has)
+        if has:
+            first = text.strip().splitlines()[0]
+            avail = max(60, self.prompt_bar_preview.width() or self.prompt_bar.width() - 190)
+            fm = self.prompt_bar_preview.fontMetrics()
+            self.prompt_bar_preview.setText(
+                fm.elidedText(first, Qt.TextElideMode.ElideRight, avail)
+            )
+
+    def _persist_prompt(self):
+        conv = self._current_conv()
+        if conv is None:
+            return
+        db_id = conv.get("db_id")
+        if db_id is None or not self._db_ready:
+            return  # stored by create_conversation on the first send
+        text = conv.get("system_prompt", "")
+        _run_async_in_thread(lambda: chat_db.update_system_prompt(db_id, text))
 
     # ------------------------------------------------------------ attachments
 
@@ -911,6 +1196,7 @@ class ChatPage(QWidget):
             "model_name": "",
             "title": tr("chat.new_chat_title"),
             "messages": [],
+            "system_prompt": str(load_ui_setting("system_prompt", "") or ""),
         }
         self.conversations.append(conv)
         row = len(self.conversations) - 1
@@ -929,6 +1215,7 @@ class ChatPage(QWidget):
                 "model_name": c.get("model_name", ""),
                 "title": c["title"],
                 "messages": [{"role": m["role"], "content": m["content"]} for m in messages],
+                "system_prompt": c.get("system_prompt", ""),
             }
             self.conversations.append(conv)
             self._add_conversation_row(len(self.conversations) - 1)
@@ -977,6 +1264,7 @@ class ChatPage(QWidget):
             if isinstance(widget, ConversationRow):
                 widget.set_active(row == index)
         self._render_messages()
+        self._apply_prompt_to_ui()
 
     def _show_conv_menu(self, pos):
         item = self.conv_list.itemAt(pos)
@@ -1239,6 +1527,8 @@ class ChatPage(QWidget):
         super().resizeEvent(event)
         if hasattr(self, "chat_title"):
             QTimer.singleShot(0, self._update_chat_title)
+        if hasattr(self, "prompt_bar"):
+            QTimer.singleShot(0, self._refresh_prompt_ui)
         if hasattr(self, "_resize_render_timer"):
             self._resize_render_timer.start()
 
@@ -1649,7 +1939,9 @@ class ChatPage(QWidget):
         def _create():
             async def _do_create():
                 try:
-                    return await chat_db.create_conversation(conv["title"], model_name)
+                    return await chat_db.create_conversation(
+                        conv["title"], model_name, conv.get("system_prompt", "")
+                    )
                 except Exception:
                     return None
             return asyncio.run(_do_create())
@@ -1703,6 +1995,11 @@ class ChatPage(QWidget):
         self._update_send_button_state()
 
         messages = list(conv["messages"])
+        # The prompt lives on the conversation, not in the transcript, so the
+        # DB rows stay clean and editing it never rewrites history.
+        prompt = conv.get("system_prompt", "").strip()
+        if prompt:
+            messages.insert(0, {"role": "system", "content": prompt})
 
         self._stream_worker = ChatStreamWorker(
             self.api, model_name, messages, 0.7, self._thinking_on,

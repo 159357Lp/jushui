@@ -812,10 +812,12 @@ class SettingsPage(QWidget):
         if self.cuda_path.text():
             config["cuda_path"] = self.cuda_path.text()
 
-        config["ui"] = {
-            "language": self.language_combo.currentData() or "zh",
-            "theme": self.theme_combo.currentData() or "dark",
-        }
+        # Merge instead of replacing: ui.* also holds sidebar_collapsed and
+        # system_prompt, which a wholesale overwrite would silently delete.
+        ui = config.get("ui") or {}
+        ui["language"] = self.language_combo.currentData() or "zh"
+        ui["theme"] = self.theme_combo.currentData() or "dark"
+        config["ui"] = ui
         set_language(config["ui"]["language"])
         self.theme_changed.emit(config["ui"]["theme"])
 
