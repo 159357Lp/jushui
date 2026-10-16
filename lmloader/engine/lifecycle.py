@@ -521,6 +521,28 @@ class LifecycleManager:
                 return False
             cmd = launch_config.to_command(binary_path)
 
+            # Auto-tier asked for a page-cache prewarm: CPU-side layers are
+            # mmap-resident, so touching every page now trades a few seconds
+            # of load time for no disk faults during the first inferences.
+            # Off the event loop; failure only costs speed, never correctness.
+            if launch_config.prewarm:
+                from lmloader.engine.offload_planner import prewarm_page_cache
+                size_mb = (model.size or 0) / (1024 * 1024)
+                event_log.info(
+                    "lifecycle",
+                    f"正在预热模型 {model.name} 的页缓存（约 {size_mb / 1024:.1f} GB，"
+                    f"首 token 前不再磁盘缺页）…",
+                    model=model.name,
+                )
+                pw_start = time.time()
+                ok = await asyncio.to_thread(prewarm_page_cache, model.path)
+                event_log.info(
+                    "lifecycle",
+                    f"页缓存预热{'完成' if ok else '失败'}"
+                    f"（{time.time() - pw_start:.1f}s{'，不影响加载' if not ok else ''}）",
+                    model=model.name,
+                )
+
             logger.info(f"Starting {engine_kind or 'engine'} ({engine_slot}): port={port}, model={model.name}")
             logger.debug(f"Command: {' '.join(cmd)}")
             event_log.info(
@@ -577,9 +599,15 @@ class LifecycleManager:
                         f"Engine exited immediately (rc={process.returncode}). "
                         f"argv={' '.join(cmd)}\n--- engine stderr tail ---\n{tail}"
                     )
+                pinned_names = [n for n, i in self.instances.items() if i.pinned]
+                hint = (
+                    f"。注意：钉选的决策模型 {'、'.join(pinned_names)} 正占用显存且不会自动卸载，"
+                    f"如需空间请手动卸载后重试"
+                    if pinned_names and (model.size or 0) / (1024 ** 3) > 8 else ""
+                )
                 event_log.error(
                     "lifecycle",
-                    f"模型 {model.name} 启动失败（健康检查超时或进程退出，端口 {port}）",
+                    f"模型 {model.name} 启动失败（健康检查超时或进程退出，端口 {port}）{hint}",
                     model=model.name, port=port,
                 )
                 await self._kill_process(process)

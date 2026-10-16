@@ -113,8 +113,10 @@ def clamp_run_config(model, cfg: dict) -> dict:
     # value >= real layer count as "offload everything" safely, so 999 is the
     # canonical full-offload sentinel; explicit smaller values (partial CPU
     # offload to save VRAM) are preserved.
+    # -1 is the "auto-tier" sentinel: the offload planner derives ngl from
+    # free VRAM at load time. Clamp must pass it through unresolved.
     gpu = int(out.get("n_gpu_layers") or 0)
-    out["n_gpu_layers"] = min(max(gpu, 0), 999)
+    out["n_gpu_layers"] = gpu if gpu == -1 else min(max(gpu, 0), 999)
 
     out["threads"] = min(max(int(out.get("threads") or 1), 1), cpu)
     out["parallel"] = min(max(int(out.get("parallel") or 1), 1), MAX_PARALLEL)
@@ -151,6 +153,7 @@ class LaunchConfig:
         mmproj_path: Optional[str] = None,
         host: str = "127.0.0.1",  # FIXED: B5
         kind: str = "llama",
+        prewarm: bool = False,
     ):
         self.model_path = model_path
         self.port = port
@@ -159,6 +162,9 @@ class LaunchConfig:
         self.mmproj_path = mmproj_path
         self.host = host
         self.kind = kind
+        # Auto-tier told the planner the model should be page-cache prewarmed
+        # before spawn (layers stay mmap-resident; see offload_planner).
+        self.prewarm = prewarm
 
     def to_command(self, binary_path: str) -> list[str]:
         cmd = [binary_path] + self.args
@@ -424,6 +430,33 @@ class EngineRouter:
 
         ctx = cfg["ctx_size"]
         gpu = cfg["n_gpu_layers"]
+        prewarm_flag = False
+        # Auto-tier (-1 sentinel): one-shot VRAM budget math at load time.
+        # Free VRAM already includes every loaded model and the desktop, so
+        # multi-model coexistence budgeting falls out of the measurement —
+        # no per-model accounting to drift out of date.
+        if gpu == -1:
+            from lmloader.engine import offload_planner
+            plan = None
+            try:
+                plan = offload_planner.plan_for_model(model, cfg)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"offload planner failed for {model.name}: {e}")
+            if plan is None:
+                gpu = 999
+                event_log.warning(
+                    "lifecycle",
+                    f"模型 {model.name} 选择了自动分层，但空闲显存/模型元数据不可测，"
+                    f"已回退为全量卸载（-ngl 999）",
+                    model=model.name,
+                )
+            else:
+                gpu = plan.n_gpu_layers
+                prewarm_flag = plan.prewarm_suggested
+                event_log.info(
+                    "lifecycle", plan.reason, model=model.name,
+                    ngl=plan.n_gpu_layers,
+                )
         threads = cfg["threads"]
         flash = cfg["flash_attn"]
         cache_k = cfg["cache_type_k"]
@@ -597,6 +630,7 @@ class EngineRouter:
             mmproj_path=detected_mmproj,
             host=defaults.host,  # FIXED: B5
             kind="llama",
+            prewarm=prewarm_flag,
         )
 
     def _find_mmproj(self, model: ModelRecord) -> Optional[str]:

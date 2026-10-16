@@ -240,20 +240,34 @@ class ModelConfigDialog(QDialog):
         # block_count: the vision mmproj and MTP draft head add layers beyond
         # the trunk, and clamping there leaves those on CPU (cuts MTP speed by
         # ~25%). Migrate legacy configs saved at the trunk-only count to 999.
+        # -1 is the auto-tier sentinel: a checkbox takes over and the spin is
+        # disabled, so the two modes can never disagree on save.
+        raw_gpu = cfg.get("n_gpu_layers")
+        gpu_val = 999 if raw_gpu is None else int(raw_gpu)
+        auto_gpu = gpu_val == -1
+        if not auto_gpu and block_count > 0 and gpu_val == block_count:
+            gpu_val = 999
+        gpu_row = QWidget()
+        gpu_hbox = QHBoxLayout(gpu_row)
+        gpu_hbox.setContentsMargins(0, 0, 0, 0)
+        self.gpu_auto_chk = QCheckBox(tr("models.cfg_gpu_auto"))
+        self.gpu_auto_chk.setToolTip(tr("models.cfg_gpu_auto_tip"))
+        self.gpu_auto_chk.setChecked(auto_gpu)
         self.gpu_spin = QSpinBox()
         self.gpu_spin.setRange(0, 999)
-        gpu_val = int(cfg.get("n_gpu_layers") or 999)
-        if block_count > 0 and gpu_val == block_count:
-            gpu_val = 999
         self.gpu_spin.setValue(min(max(gpu_val, 0), 999))
         self.gpu_spin.setSpecialValueText(tr("models.cfg_gpu_cpu"))
+        self.gpu_spin.setDisabled(auto_gpu)
         if block_count > 0:
             self.gpu_spin.setToolTip(
                 tr("models.cfg_gpu_tip") + f" [trunk layers: {block_count}]"
             )
         else:
             self.gpu_spin.setToolTip(tr("models.cfg_gpu_tip"))
-        form.addRow(tr("models.cfg_gpu"), self.gpu_spin)
+        gpu_hbox.addWidget(self.gpu_spin, 1)
+        gpu_hbox.addWidget(self.gpu_auto_chk)
+        self.gpu_auto_chk.toggled.connect(self.gpu_spin.setDisabled)
+        form.addRow(tr("models.cfg_gpu"), gpu_row)
 
         # CPU threads — must not exceed logical core count
         self.threads_spin = QSpinBox()
@@ -424,7 +438,7 @@ class ModelConfigDialog(QDialog):
     def _values(self) -> dict:
         vals = {
             "ctx_size": self.ctx_spin.value(),
-            "n_gpu_layers": self.gpu_spin.value(),
+            "n_gpu_layers": -1 if self.gpu_auto_chk.isChecked() else self.gpu_spin.value(),
             "threads": self.threads_spin.value(),
             "parallel": self.parallel_spin.value(),
             "flash_attn": self.flash_chk.isChecked(),

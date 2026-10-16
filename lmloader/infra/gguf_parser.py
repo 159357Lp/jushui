@@ -82,6 +82,7 @@ class GGUFMetadata:
         supports_mtp: bool,
         raw_metadata: dict,
         decision_type: str = "",
+        vocab_size: int = 0,
     ):
         self.architecture = architecture
         self.quantization = quantization
@@ -95,6 +96,7 @@ class GGUFMetadata:
         self.block_count = block_count
         self.supports_mtp = supports_mtp
         self.decision_type = decision_type
+        self.vocab_size = vocab_size
         self.raw_metadata = raw_metadata
 
     def to_dict(self) -> dict:
@@ -111,6 +113,7 @@ class GGUFMetadata:
             "block_count": self.block_count,
             "supports_mtp": self.supports_mtp,
             "decision_type": self.decision_type,
+            "vocab_size": self.vocab_size,
         }
 
 
@@ -166,6 +169,19 @@ def parse_gguf(file_path: str, force: bool = False) -> Optional[GGUFMetadata]:
             if val is not None and isinstance(val, str) and len(val) < 1000:
                 raw_metadata[field_name] = val
 
+        # Vocab size feeds the offload planner's heavy-tail reserve (input
+        # embedding + output table dwarf an average trunk layer on 150k+-vocab
+        # models). It is an ARRAY field, so the element count is the value.
+        vocab_size = 0
+        tok_field = reader.fields.get("tokenizer.ggml.tokens")
+        if tok_field is not None:
+            try:
+                n = len(tok_field.parts)
+                if 0 < n < 10_000_000:
+                    vocab_size = n
+            except (TypeError, AttributeError):
+                pass
+
         metadata = GGUFMetadata(
             architecture=architecture,
             quantization=quantization,
@@ -182,6 +198,7 @@ def parse_gguf(file_path: str, force: bool = False) -> Optional[GGUFMetadata]:
             decision_type=_get_string(reader, f"{architecture}.decision.type")
             or next((v for k, v in raw_metadata.items()
                      if k.endswith(".decision.type")), ""),
+            vocab_size=vocab_size,
         )
 
         logger.info(f"Parsed GGUF: {path.name} - {architecture} {quantization} {parameters}")
