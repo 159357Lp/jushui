@@ -37,6 +37,11 @@ _PALETTES = {
         "red_bg": "#da363322",
         "red_border": "#da363344",
         "warn": "#d29922",
+        # memory-breakdown segments (monitor page): weights/kv/state reuse
+        # accent/green/warn, these two have no existing semantic token.
+        "mem_compute": "#a371f7",
+        "mem_other": "#484f58",
+        "mem_system": "#6E7681",
         "log_bg": "#0d1117",        # terminal log panel
         "log_fg": "#c9d1d9",
         # sidebar (dark rail) — dark theme keeps the same near-black rail
@@ -73,6 +78,9 @@ _PALETTES = {
         "red_bg": "#FDECEC",
         "red_border": "#F7CDCF",
         "warn": "#E5853D",
+        "mem_compute": "#7C3AED",
+        "mem_other": "#B3BAC8",
+        "mem_system": "#E4E8F1",
         "log_bg": "#0F1420",        # console-style log panel
         "log_fg": "#A9B1C6",
         # dark rail sidebar (design spec: sidebar stays dark in light theme)

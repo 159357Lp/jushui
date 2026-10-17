@@ -33,6 +33,17 @@ from lmloader.logger import logger
 # than "wrong answer".
 REAP_TIMEOUT = 5.0
 
+# llama-common echoes every resolved parameter and tokenizer detail, but only
+# once verbosity passes its default. We assembled those arguments ourselves, so
+# echoing them back is noise; the server's own operational lines still pass.
+# See _read_stderr, which pairs this with libllama's untagged INFO stream.
+_V4_ECHO_TAGS = frozenset({"common_param", "common_init_", "common_params_fit_impl"})
+
+# Only used to decide what must never be swallowed as a multi-line-dump
+# continuation: llama.cpp prints its own aborts and ggml assertion failures
+# without the "<elapsed> <level> " prefix, so nothing but the wording tells us.
+_CRASH_KEYS = ("error", "fatal", "failed", "abort", "assert", "exception")
+
 
 async def _get_run_config_sync(model_name: str) -> Optional[dict]:
     """Load the saved per-model run config (None if not saved)."""
@@ -78,6 +89,11 @@ class ModelInstance:
         self._stderr_raw: deque[str] = deque(maxlen=80)
         # slot -> latest timing metrics parsed from print_timing output
         self.latest_timing: dict[int, dict] = {}
+        # (device, kind) -> MiB, parsed from the engine's own allocation report.
+        # Latest value wins: sched_reserve reprints the compute buffers whenever
+        # the graph is re-reserved, so these are steady-state sizes, not a sum.
+        self.memory_buffers: dict[tuple[str, str], float] = {}
+        self.memory_summary_emitted = False
         # d3 packages only: the System One contract reported by the package's
         # own server (modalities, token/media limits). None for other engines.
         self.system_one: Optional[dict] = None
@@ -128,6 +144,7 @@ class ModelInstance:
             "parallel": self._arg_value("--parallel"),
             "flash_attn": self._arg_value("--flash-attn"),
             "metrics": self._latest_metrics(),
+            "memory": self.memory_breakdown(),
         }
 
     def _latest_metrics(self) -> Optional[dict]:
@@ -141,6 +158,91 @@ class ModelInstance:
         if out.get("tg_final"):
             out["tg"] = out["tg_final"]
         return out
+
+    # llama.cpp prefixes every stderr line it initiates with "<elapsed> <level>
+    # <tag>: " — "1.23.456.789 I srv  llama_server: ...". llama-common and the
+    # server insert a module word (srv/cmn/slot/spec) before the function name,
+    # libllama lines have no module, and "slot  operator ():" puts empty parens
+    # before the colon, so the tag has to be allowed to be followed by them.
+    _RE_ENG_LINE = re.compile(
+        r"^\d+\.\d+\.\d+\.\d+\s+([IWED])\s+(?:(srv|cmn|slot|spec)\s+)?(\S+?)\s*(?:\(\S*\)\s*)?:"
+    )
+
+    # llama.cpp prints one line per (device, buffer class) when it allocates,
+    # e.g. "load_tensors:  CPU_Mapped model buffer size = 2009.38 MiB" or
+    # "llama_kv_cache:  CUDA0 KV buffer size = 96.00 MiB". Only visible at -lv 4.
+    _RE_MEMBUF = re.compile(
+        r"\b(?P<device>[A-Za-z][A-Za-z0-9_]*)\s+"
+        r"(?P<kind>model|KV|RS|compute|output)\s+buffer size\s*=\s*"
+        r"(?P<mib>[0-9]+(?:\.[0-9]+)?)\s*MiB"
+    )
+    _MEM_KINDS = {
+        "model": "weights",
+        "KV": "kv",
+        "RS": "recurrent",
+        "compute": "compute",
+        "output": "output",
+    }
+
+    @staticmethod
+    def _device_bucket(device: str) -> str:
+        """CUDA0/Vulkan0/Metal are device memory; CPU*/…_Host are system RAM.
+
+        Pinned host buffers show up as "CUDA_Host", so the _Host suffix must be
+        checked before the CUDA prefix.
+        """
+        if device.startswith("CPU") or device.endswith("_Host"):
+            return "ram"
+        return "vram"
+
+    def parse_memory_line(self, line: str) -> bool:
+        """Record one allocation-report line. True if this line was one."""
+        m = self._RE_MEMBUF.search(line)
+        if not m:
+            return False
+        kind = self._MEM_KINDS.get(m.group("kind"))
+        if not kind:
+            return False
+        self.memory_buffers[(m.group("device"), kind)] = float(m.group("mib"))
+        return True
+
+    def memory_breakdown(self) -> Optional[dict]:
+        """Engine-reported weights / KV / state split across VRAM and RAM, MiB.
+
+        None until the engine has printed anything, so the GUI can tell "not
+        reported yet" apart from "reported as zero".
+        """
+        if not self.memory_buffers:
+            return None
+        buckets: dict[str, dict[str, float]] = {
+            "vram": {}, "ram": {},
+        }
+        devices: dict[str, dict[str, float]] = {}
+        for (device, kind), mib in self.memory_buffers.items():
+            bucket = self._device_bucket(device)
+            buckets[bucket][kind] = buckets[bucket].get(kind, 0.0) + mib
+            devices.setdefault(device, {})[kind] = mib
+        return {
+            "vram": buckets["vram"],
+            "ram": buckets["ram"],
+            "devices": devices,
+            "total_mib": {
+                "vram": sum(buckets["vram"].values()),
+                "ram": sum(buckets["ram"].values()),
+            },
+        }
+
+    def _memory_log_line(self) -> str:
+        bd = self.memory_breakdown()
+        if not bd:
+            return ""
+        v, r = bd["vram"], bd["ram"]
+        return (
+            f"显存 权重 {v.get('weights', 0):.0f} + KV {v.get('kv', 0):.0f} "
+            f"+ 状态 {v.get('recurrent', 0):.0f} + 计算 {v.get('compute', 0):.0f} MiB；"
+            f"内存 权重 {r.get('weights', 0):.0f} + KV {r.get('kv', 0):.0f} "
+            f"+ 状态 {r.get('recurrent', 0):.0f} + 计算 {r.get('compute', 0):.0f} MiB"
+        )
 
     # print_timing line patterns (llama.cpp / PrismML fork share these)
     _RE_TG = re.compile(
@@ -273,6 +375,7 @@ class ModelInstance:
     async def _read_stderr(self):
         """Drain stderr (prevents pipe blocking) and mirror to Developer Logs."""
         emitted = 0
+        last_level = ""
         cap = 1200  # per-instance ceiling so a chatty engine can't flood the ring
         try:
             while self.process.returncode is None:
@@ -293,10 +396,41 @@ class ModelInstance:
                     except Exception as e:  # noqa: BLE001
                         logger.debug(f"timing parse error: {e}")
                     continue
+                if self.parse_memory_line(cleaned):
+                    continue
+                low = cleaned.lower()
+                m = self._RE_ENG_LINE.match(cleaned)
+                eng_level = m.group(1) if m else ""
+                eng_module = m.group(2) if m else None
+                eng_tag = m.group(3) if m else ""
+                if m:
+                    last_level = eng_level
+                # -lv 4 (needed for the allocation report above) also switches on
+                # libllama's whole INFO stream — tensor tables, metadata dumps,
+                # scheduler reserves. None of it appeared at the old default of 3,
+                # and it would bury the Developer Logs, so it stays in the debug
+                # file. Errors and warnings still pass.
+                if eng_level == "I" and (
+                    eng_module is None or eng_tag in _V4_ECHO_TAGS
+                ):
+                    continue
+                # llama.cpp tags every line it initiates with "<elapsed> <level> ",
+                # but a multi-line dump (chat-template example, sampler parameter
+                # block) prints its body lines untagged. Split out, those read as
+                # garbage. Other engines are untagged by nature, so a bare line is
+                # only a continuation when it follows a tagged INFO line — and even
+                # then a line that talks about failing is kept, because a crash
+                # trace from llama.cpp has no prefix of its own.
+                if (
+                    not m
+                    and self.launch_config.kind == "llama"
+                    and last_level == "I"
+                    and not any(k in low for k in _CRASH_KEYS)
+                ):
+                    continue
                 if emitted >= cap:
                     continue
                 emitted += 1
-                low = cleaned.lower()
                 # Benign, self-handled engine notices that fire on every load —
                 # surface them as info rather than scary warnings.
                 benign = (
@@ -307,9 +441,6 @@ class ModelInstance:
                     "more info: https://github.com/ggml-org/llama.cpp/pull/25655",
                 )
                 is_benign = any(k in low for k in benign)
-                # llama.cpp prefixes lines with "  I  " / "  W  " / "  E  "
-                m = re.match(r"^\d+\.\d+\.\d+\.\d+\s+([IWED])\s", cleaned)
-                eng_level = m.group(1) if m else ""
                 if eng_level == "E" or any(
                     k in low for k in ("error:", "fatal", "failed to", "aborted")
                 ):
@@ -320,6 +451,11 @@ class ModelInstance:
                     event_log.warning("engine", cleaned, model=self.model.name)
                 else:
                     event_log.info("engine", cleaned, model=self.model.name)
+                if "model loaded" in low and not self.memory_summary_emitted:
+                    self.memory_summary_emitted = True
+                    line = self._memory_log_line()
+                    if line:
+                        event_log.info("engine", line, model=self.model.name)
         except Exception as e:
             logger.debug(f"stderr reader error: {e}")
 

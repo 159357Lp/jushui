@@ -499,6 +499,14 @@ class EngineRouter:
         args += ["--parallel", str(parallel)]
         args += ["--threads", str(threads)]
 
+        # Verbosity 4 is what makes libllama print its per-device allocation
+        # report (model / KV / recurrent-state / compute buffer sizes). At the
+        # default 3 those lines are suppressed, and they are the only source of
+        # a real weights-vs-KV split — nvidia-smi reports [N/A] per process on
+        # Windows. lifecycle parses them for the monitor page's memory
+        # breakdown; the extra log chatter is filtered out there, not here.
+        args += ["-lv", "4"]
+
         # Reasoning/thinking control. -1 (default) = omit and keep the engine
         # default; 0 = cap thinking to zero tokens (no reasoning_content);
         # N>0 = cap thinking to N tokens.
