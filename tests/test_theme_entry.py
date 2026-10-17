@@ -81,6 +81,20 @@ def test_reapplying_the_same_picture_does_not_pile_up_copies(scratch, picture):
     assert list(first.parent.glob("*")) == [first], "同一张图每次应用都复制一份"
 
 
+def test_retaking_colour_from_the_stored_picture_copies_nothing(scratch, picture):
+    """「重新取色」喂回来的是数据目录里那条路径，不是用户原始文件。
+
+    存下来的文件名茎部已经带哈希，再按同一规则命名会一直往后追加哈希段，
+    每次点击多留一份几 MB 的重复图——他的 themes 目录里就是这么攒出三份的。
+    """
+    from lmloader.gui.theme_picker import apply_palette
+
+    first = apply_palette(picture, _extract(picture))
+    again = apply_palette(first, _extract(first))
+    assert again == first, f"源图已在数据目录里还重新复制: {again.name}"
+    assert [p.name for p in first.parent.glob("*")] == [first.name]
+
+
 def test_selection_is_what_makes_a_palette_visible(scratch, picture, monkeypatch):
     """反向对照：把"选中主题"这一步抹掉，界面必须还是内置那套。
 

@@ -77,6 +77,11 @@ def store_source(path: str | Path) -> Path:
     src = Path(path)
     dest_dir = theme_dir()
     dest_dir.mkdir(parents=True, exist_ok=True)
+    # "重新取色" feeds the stored path back in. Its stem already ends in the
+    # digest, so hashing it again would append a second suffix and leave a fresh
+    # multi-megabyte copy of the same picture on every click.
+    if src.parent.resolve() == dest_dir.resolve():
+        return src
     digest = hashlib.sha1(src.read_bytes()).hexdigest()[:8]
     dest = dest_dir / f"{src.stem}-{digest}{src.suffix.lower()}"
     if not dest.exists():
