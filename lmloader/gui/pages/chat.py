@@ -75,32 +75,15 @@ class ConversationRow(QWidget):
         self.delete_button.clicked.connect(on_delete)
         layout.addWidget(self.delete_button)
 
-        self.setStyleSheet(f"""
-            ConversationRow {{
-                background-color: transparent;
-                border-radius: 10px;
-            }}
-            QLabel {{
-                color: {c('muted')};
-                background: transparent;
-            }}
-            QPushButton#conversationDelete {{
-                padding: 0;
-                min-height: 0;
-                color: {c('muted')};
-                background: transparent;
-                border: none;
-                border-radius: 8px;
-                font-size: 18px;
-            }}
-            QPushButton#conversationDelete:hover {{
-                color: {c('red')};
-                background: {c('red_bg')};
-            }}
-        """)
+        # One source of truth for the row's colours, so a theme switch only has
+        # to re-run _apply_style().
+        self._apply_style()
         self._watched_widgets = [self, self.delete_button]
         for widget in self._watched_widgets:
             widget.installEventFilter(self)
+
+    def retheme(self):
+        self._apply_style()
 
     def set_title(self, title: str):
         self._title = title
@@ -217,6 +200,9 @@ class ChatPage(QWidget):
         # System prompt panel state. _prompt_syncing guards the programmatic
         # setText() path (switching conversations) from re-triggering a save.
         self._prompt_syncing = False
+        # (widget, qss-or-callable) for every inline style that must follow the
+        # palette; retheme() re-applies them. See _bind_style.
+        self._style_bindings: list[tuple] = []
         self._init_ui()
         self._stream_render_timer = QTimer(self)
         self._stream_render_timer.setInterval(100)
@@ -283,6 +269,36 @@ class ChatPage(QWidget):
 
         main_layout.addWidget(splitter)
 
+    # ------------------------------------------------------------------ theming
+
+    def _bind_style(self, widget, qss):
+        """Apply an inline stylesheet and remember it for the next theme switch.
+
+        `qss` is a string or a zero-arg callable. Pass the callable when the
+        style also depends on widget state, so retheme() reads what the state
+        is now rather than what it was when the widget got built.
+        """
+        self._style_bindings.append((widget, qss))
+        widget.setStyleSheet(qss() if callable(qss) else qss)
+
+    def retheme(self):
+        """Re-resolve every colour this page baked into inline QSS.
+
+        apply_theme() only repaints the app-wide stylesheet. This page also
+        styles individual widgets from c() — those keep the old palette until
+        they are re-applied, and the message bubbles until they are rebuilt.
+        """
+        for widget, qss in self._style_bindings:
+            widget.setStyleSheet(qss() if callable(qss) else qss)
+        for index in range(self.conv_list.count()):
+            row = self.conv_list.itemWidget(self.conv_list.item(index))
+            if isinstance(row, ConversationRow):
+                row.retheme()
+        self._update_thinking_btn()
+        self._render_attachments()
+        self._render_messages(preserve_scroll=True)
+        self._refresh_prompt_ui()
+
     def _build_sidebar(self) -> QWidget:
         # NOTE: objectName must NOT be "sidebar" — the main window's dark rail
         # owns that id and the global #sidebar rule would paint this panel dark.
@@ -290,9 +306,10 @@ class ChatPage(QWidget):
         sidebar.setObjectName("chatSidebar")
         sidebar.setMaximumWidth(320)
         sidebar.setMinimumWidth(210)
-        sidebar.setStyleSheet(
-            f"QWidget#chatSidebar {{ background-color: {c('surface')};"
-            f" border-right: 1px solid {c('border')}; }}"
+        self._bind_style(
+            sidebar,
+            lambda: f"QWidget#chatSidebar {{ background-color: {c('surface')};"
+                    f" border-right: 1px solid {c('border')}; }}",
         )
         layout = QVBoxLayout(sidebar)
         layout.setContentsMargins(12, 14, 12, 12)
@@ -302,14 +319,14 @@ class ChatPage(QWidget):
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(6)
         heading = QLabel(tr("chat.history"))
-        heading.setStyleSheet(f"font-size: 16px; font-weight: 700; color: {c('title')};")
+        self._bind_style(heading, self._heading_qss)
         header.addWidget(heading, 1)
         self.export_btn = QPushButton("⤓")
         self.export_btn.setFixedSize(30, 30)
         self.export_btn.setCursor(Qt.PointingHandCursor)
         self.export_btn.setToolTip(tr("chat.save_conv"))
         self.export_btn.clicked.connect(self._save_conversation)
-        self.export_btn.setStyleSheet(self._icon_btn_qss())
+        self._bind_style(self.export_btn, self._icon_btn_qss)
         header.addWidget(self.export_btn)
         layout.addLayout(header)
 
@@ -318,25 +335,22 @@ class ChatPage(QWidget):
         new_btn.clicked.connect(self._new_conversation)
         new_btn.setCursor(Qt.PointingHandCursor)
         new_btn.setMinimumHeight(38)
-        new_btn.setStyleSheet(
-            f"QPushButton#primary {{ background-color: {c('accent')}; border-color: {c('accent')};"
-            f" color: white; font-weight: 600; }}"
-            f" QPushButton#primary:hover {{ background-color: {c('accent_hover')}; }}"
-        )
+        self._bind_style(new_btn, self._primary_btn_qss)
         layout.addWidget(new_btn)
 
         self.conv_list = QListWidget()
-        self.conv_list.setStyleSheet(f"""
-            QListWidget {{
+        # No theme colour in here at all, so nothing to bind.
+        self.conv_list.setStyleSheet("""
+            QListWidget {
                 background-color: transparent;
                 border: none;
                 outline: none;
-            }}
-            QListWidget::item {{
+            }
+            QListWidget::item {
                 padding: 0;
                 border: none;
                 background: transparent;
-            }}
+            }
         """)
         self.conv_list.setSpacing(2)
         self.conv_list.currentRowChanged.connect(self._switch_conversation)
@@ -357,7 +371,7 @@ class ChatPage(QWidget):
         top_bar.setContentsMargins(0, 0, 0, 8)
         self.chat_title = QLabel(tr("chat.new_chat_title"))
         self.chat_title.setMaximumWidth(360)
-        self.chat_title.setStyleSheet(f"font-size: 16px; font-weight: 700; color: {c('title')};")
+        self._bind_style(self.chat_title, self._heading_qss)
         self._chat_title_full = ""
         self._set_chat_title(tr("chat.new_chat_title"))
         top_bar.addWidget(self.chat_title)
@@ -367,23 +381,26 @@ class ChatPage(QWidget):
         # 系统提示词摘要条：面板收起时也始终看得见模型被交代了什么。
         self.prompt_bar = QFrame()
         self.prompt_bar.setObjectName("chatPromptBar")
-        self.prompt_bar.setStyleSheet(
-            f"QFrame#chatPromptBar {{ background: {c('accent_soft')};"
-            f" border: 1px solid {c('accent_border')}; border-radius: 8px; }}"
-            " QFrame#chatPromptBar QLabel { background: transparent; }"
+        self._bind_style(
+            self.prompt_bar,
+            lambda: f"QFrame#chatPromptBar {{ background: {c('accent_soft')};"
+                    f" border: 1px solid {c('accent_border')}; border-radius: 8px; }}"
+                    " QFrame#chatPromptBar QLabel { background: transparent; }",
         )
         bar_layout = QHBoxLayout(self.prompt_bar)
         bar_layout.setContentsMargins(10, 5, 8, 5)
         bar_layout.setSpacing(8)
         bar_title = QLabel(tr("chat.prompt_title"))
-        bar_title.setStyleSheet(f"color: {c('accent')}; font-size: 12px; font-weight: 600;")
+        self._bind_style(bar_title, self._section_label_qss)
         bar_layout.addWidget(bar_title)
         self.prompt_bar_preview = QLabel("")
-        self.prompt_bar_preview.setStyleSheet(f"color: {c('muted')}; font-size: 12px;")
+        self._bind_style(
+            self.prompt_bar_preview, lambda: f"color: {c('muted')}; font-size: 12px;"
+        )
         bar_layout.addWidget(self.prompt_bar_preview, 1)
         bar_edit = QPushButton(tr("chat.prompt_edit"))
         bar_edit.setCursor(Qt.PointingHandCursor)
-        bar_edit.setStyleSheet(self._mini_action_qss())
+        self._bind_style(bar_edit, self._mini_action_qss)
         bar_edit.clicked.connect(self._open_prompt_panel)
         bar_layout.addWidget(bar_edit)
         self.prompt_bar.setVisible(False)
@@ -395,9 +412,10 @@ class ChatPage(QWidget):
         self.chat_scroll.setFrameShape(QFrame.NoFrame)
         self.chat_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.chat_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.chat_scroll.setStyleSheet(
-            f"QScrollArea#chatDisplay {{ background-color: {c('bg')}; border: none; }}"
-            f" QScrollArea#chatDisplay QWidget#chatMessages {{ background-color: {c('bg')}; }}"
+        self._bind_style(
+            self.chat_scroll,
+            lambda: f"QScrollArea#chatDisplay {{ background-color: {c('bg')}; border: none; }}"
+                    f" QScrollArea#chatDisplay QWidget#chatMessages {{ background-color: {c('bg')}; }}",
         )
         self.chat_messages = QWidget()
         self.chat_messages.setObjectName("chatMessages")
@@ -409,13 +427,11 @@ class ChatPage(QWidget):
 
         composer = QWidget()
         composer.setObjectName("chatComposer")
-        composer.setStyleSheet(f"""
-            QWidget#chatComposer {{
-                background-color: {c('surface')};
-                border: 1px solid {c('border')};
-                border-radius: 12px;
-            }}
-        """)
+        self._bind_style(
+            composer,
+            lambda: f"QWidget#chatComposer {{ background-color: {c('surface')};"
+                    f" border: 1px solid {c('border')}; border-radius: 12px; }}",
+        )
         composer_layout = QVBoxLayout(composer)
         composer_layout.setContentsMargins(10, 8, 10, 9)
         composer_layout.setSpacing(6)
@@ -433,7 +449,7 @@ class ChatPage(QWidget):
         self.model_combo.setMaximumWidth(340)
         self.model_combo.setCursor(Qt.PointingHandCursor)
         self.model_combo.setToolTip(tr("chat.model_tip"))
-        self.model_combo.setStyleSheet(self._model_combo_qss())
+        self._bind_style(self.model_combo, self._model_combo_qss)
         self.model_combo.currentIndexChanged.connect(self._on_model_selected)
         toolbar.addWidget(self.model_combo)
 
@@ -442,14 +458,14 @@ class ChatPage(QWidget):
         refresh_btn.setCursor(Qt.PointingHandCursor)
         refresh_btn.setToolTip(tr("chat.refresh"))
         refresh_btn.clicked.connect(self._load_models)
-        refresh_btn.setStyleSheet(self._chip_btn_qss())
+        self._bind_style(refresh_btn, self._chip_btn_qss)
         toolbar.addWidget(refresh_btn)
 
         self.attach_btn = QPushButton(tr("chat.attach"))
         self.attach_btn.setCursor(Qt.PointingHandCursor)
         self.attach_btn.setToolTip(tr("chat.attach_tip"))
         self.attach_btn.clicked.connect(self._pick_attachment)
-        self.attach_btn.setStyleSheet(self._chip_btn_qss())
+        self._bind_style(self.attach_btn, self._chip_btn_qss)
         toolbar.addWidget(self.attach_btn)
 
         self.thinking_btn = QPushButton(tr("chat.thinking"))
@@ -463,12 +479,14 @@ class ChatPage(QWidget):
         self.prompt_btn.setCheckable(True)
         self.prompt_btn.setCursor(Qt.PointingHandCursor)
         self.prompt_btn.setToolTip(tr("chat.prompt_tip"))
-        self.prompt_btn.setStyleSheet(self._prompt_chip_qss())
+        self._bind_style(self.prompt_btn, self._prompt_chip_qss)
         self.prompt_btn.toggled.connect(self._on_prompt_panel_toggled)
         toolbar.addWidget(self.prompt_btn)
         toolbar.addStretch()
         input_hint = QLabel(tr("chat.input_hint"))
-        input_hint.setStyleSheet(f"color: {c('muted')}; font-size: 11px;")
+        self._bind_style(
+            input_hint, lambda: f"color: {c('muted')}; font-size: 11px;"
+        )
         toolbar.addWidget(input_hint)
         composer_layout.addLayout(toolbar)
 
@@ -495,9 +513,10 @@ class ChatPage(QWidget):
         self.input_box.setPlaceholderText(tr("chat.input_placeholder"))
         self.input_box.setMaximumHeight(72)
         self.input_box.setMinimumHeight(44)
-        self.input_box.setStyleSheet(
-            f"QTextEdit#chat_input {{ background-color: transparent; border: none;"
-            f" border-radius: 0; padding: 7px; color: {c('fg')}; }}"
+        self._bind_style(
+            self.input_box,
+            lambda: f"QTextEdit#chat_input {{ background-color: transparent; border: none;"
+                    f" border-radius: 0; padding: 7px; color: {c('fg')}; }}",
         )
         self.input_box.installEventFilter(self)
         bottom.addWidget(self.input_box, 1)
@@ -506,16 +525,7 @@ class ChatPage(QWidget):
         send_btn.setObjectName("primary")
         send_btn.setMinimumSize(78, 36)
         send_btn.setCursor(Qt.PointingHandCursor)
-        send_btn.setStyleSheet(
-            f"QPushButton#primary {{ background-color: {c('accent')}; border-color: {c('accent')};"
-            f" color: white; font-weight: 600; }}"
-            f" QPushButton#primary:hover {{ background-color: {c('accent_hover')}; }}"
-            # Streaming state: the same button becomes the stop control. Without
-            # it a runaway generation can only be ended by closing the app.
-            f" QPushButton#primary[danger='true'] {{ background-color: {c('red')};"
-            f" border-color: {c('red')}; color: white; font-weight: 600; }}"
-            f" QPushButton#primary[danger='true']:hover {{ border-color: {c('red')}; }}"
-        )
+        self._bind_style(send_btn, lambda: self._primary_btn_qss(danger=True))
         send_btn.clicked.connect(self._on_send_or_stop)
         self.send_btn = send_btn
         bottom.addWidget(send_btn)
@@ -528,10 +538,11 @@ class ChatPage(QWidget):
         self._toast_label.setAlignment(Qt.AlignCenter)
         self._toast_label.setWordWrap(True)
         self._toast_label.setVisible(False)
-        self._toast_label.setStyleSheet(
-            f"QLabel#chatToast {{ background: {c('green_bg')}; color: {c('green')};"
-            f" border: 1px solid {c('green')}; border-radius: 10px;"
-            " padding: 6px 10px; font-size: 11px; }}"
+        self._bind_style(
+            self._toast_label,
+            lambda: f"QLabel#chatToast {{ background: {c('green_bg')}; color: {c('green')};"
+                    f" border: 1px solid {c('green')}; border-radius: 10px;"
+                    " padding: 6px 10px; font-size: 11px; }}",
         )
         layout.addWidget(self._toast_label)
         return area
@@ -600,6 +611,31 @@ class ChatPage(QWidget):
     # ------------------------------------------------------------ system prompt
 
     @staticmethod
+    def _heading_qss() -> str:
+        return f"font-size: 16px; font-weight: 700; color: {c('title')};"
+
+    @staticmethod
+    def _section_label_qss() -> str:
+        return f"color: {c('accent')}; font-size: 12px; font-weight: 600;"
+
+    @staticmethod
+    def _primary_btn_qss(danger: bool = False) -> str:
+        qss = (
+            f"QPushButton#primary {{ background-color: {c('accent')};"
+            f" border-color: {c('accent')}; color: {c('on_accent')}; font-weight: 600; }}"
+            f" QPushButton#primary:hover {{ background-color: {c('accent_hover')}; }}"
+        )
+        if danger:
+            # Streaming state: the same button becomes the stop control. Without
+            # it a runaway generation can only be ended by closing the app.
+            qss += (
+                f" QPushButton#primary[danger='true'] {{ background-color: {c('red')};"
+                f" border-color: {c('red')}; color: {c('on_accent')}; font-weight: 600; }}"
+                f" QPushButton#primary[danger='true']:hover {{ border-color: {c('red')}; }}"
+            )
+        return qss
+
+    @staticmethod
     def _prompt_chip_qss() -> str:
         return (
             f"QPushButton {{ color: {c('muted')}; background: transparent;"
@@ -623,10 +659,11 @@ class ChatPage(QWidget):
     def _build_prompt_panel(self) -> QWidget:
         panel = QFrame()
         panel.setObjectName("chatPromptPanel")
-        panel.setStyleSheet(
-            f"QFrame#chatPromptPanel {{ background: {c('bg')};"
-            f" border: 1px solid {c('accent_border')}; border-radius: 10px; }}"
-            " QFrame#chatPromptPanel QLabel { background: transparent; }"
+        self._bind_style(
+            panel,
+            lambda: f"QFrame#chatPromptPanel {{ background: {c('bg')};"
+                    f" border: 1px solid {c('accent_border')}; border-radius: 10px; }}"
+                    " QFrame#chatPromptPanel QLabel { background: transparent; }",
         )
         box = QVBoxLayout(panel)
         box.setContentsMargins(10, 8, 10, 8)
@@ -635,7 +672,7 @@ class ChatPage(QWidget):
         head = QHBoxLayout()
         head.setSpacing(8)
         title = QLabel(tr("chat.prompt_title"))
-        title.setStyleSheet(f"color: {c('accent')}; font-size: 12px; font-weight: 600;")
+        self._bind_style(title, self._section_label_qss)
         head.addWidget(title)
 
         self.prompt_scope = QComboBox()
@@ -658,12 +695,12 @@ class ChatPage(QWidget):
         head.addStretch()
         clear_btn = QPushButton(tr("chat.prompt_clear"))
         clear_btn.setCursor(Qt.PointingHandCursor)
-        clear_btn.setStyleSheet(self._mini_action_qss())
+        self._bind_style(clear_btn, self._mini_action_qss)
         clear_btn.clicked.connect(self._clear_prompt)
         head.addWidget(clear_btn)
         close_btn = QPushButton(tr("chat.prompt_collapse"))
         close_btn.setCursor(Qt.PointingHandCursor)
-        close_btn.setStyleSheet(self._mini_action_qss())
+        self._bind_style(close_btn, self._mini_action_qss)
         close_btn.clicked.connect(lambda: self.prompt_btn.setChecked(False))
         head.addWidget(close_btn)
         box.addLayout(head)
@@ -673,11 +710,12 @@ class ChatPage(QWidget):
         self.prompt_box.setPlaceholderText(tr("chat.prompt_placeholder"))
         self.prompt_box.setMinimumHeight(76)
         self.prompt_box.setMaximumHeight(150)
-        self.prompt_box.setStyleSheet(
-            f"QTextEdit#chatPromptBox {{ background: {c('surface')};"
-            f" border: 1px solid {c('border')}; border-radius: 8px;"
-            f" color: {c('fg')}; font-size: 13px; padding: 6px 8px; }}"
-            f" QTextEdit#chatPromptBox:focus {{ border-color: {c('accent')}; }}"
+        self._bind_style(
+            self.prompt_box,
+            lambda: f"QTextEdit#chatPromptBox {{ background: {c('surface')};"
+                    f" border: 1px solid {c('border')}; border-radius: 8px;"
+                    f" color: {c('fg')}; font-size: 13px; padding: 6px 8px; }}"
+                    f" QTextEdit#chatPromptBox:focus {{ border-color: {c('accent')}; }}",
         )
         self.prompt_box.textChanged.connect(self._on_prompt_text_changed)
         box.addWidget(self.prompt_box)
@@ -685,14 +723,14 @@ class ChatPage(QWidget):
         foot = QHBoxLayout()
         foot.setSpacing(10)
         self.prompt_count = QLabel("")
-        self.prompt_count.setStyleSheet(f"color: {c('fg')}; font-size: 11px;")
+        self._bind_style(self.prompt_count, lambda: f"color: {c('fg')}; font-size: 11px;")
         foot.addWidget(self.prompt_count)
         self.prompt_state = QLabel("")
         self.prompt_state.setStyleSheet(f"color: {c('muted')}; font-size: 11px;")
         foot.addWidget(self.prompt_state)
         foot.addStretch()
         hint = QLabel(tr("chat.prompt_inject_hint"))
-        hint.setStyleSheet(f"color: {c('dim')}; font-size: 11px;")
+        self._bind_style(hint, lambda: f"color: {c('dim')}; font-size: 11px;")
         foot.addWidget(hint)
         box.addLayout(foot)
 
@@ -1569,7 +1607,7 @@ class ChatPage(QWidget):
         avatar.setFixedSize(30, 30)
         avatar.setAlignment(Qt.AlignCenter)
         avatar_color = c("accent_surface") if is_user else c("accent")
-        avatar_text = c("accent") if is_user else "#ffffff"
+        avatar_text = c("accent") if is_user else c("on_accent")
         avatar.setStyleSheet(
             f"QLabel {{ background-color: {avatar_color}; color: {avatar_text};"
             " border-radius: 10px; font-size: 11px; font-weight: 700; }"

@@ -93,6 +93,10 @@ class MainWindow(QMainWindow):
         for page in (self.models_page, self.download_page):
             if hasattr(page, "_refresh"):
                 page._refresh()
+        # The chat page styles ~20 widgets from c() at build time; without this
+        # a theme switch leaves it half in the old palette.
+        if hasattr(self.chat_page, "retheme"):
+            self.chat_page.retheme()
         if hasattr(self.logs_page, "retheme"):
             self.logs_page.retheme()
         if (self.stack.currentWidget() is self.monitor_page
