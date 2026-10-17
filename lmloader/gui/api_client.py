@@ -283,6 +283,12 @@ class LMLoaderAPI:
                             return
                         try:
                             data = json.loads(data_str)
+                            if isinstance(data, dict) and "error" in data:
+                                # An error event has no choices, so without this
+                                # the loop would end silently on an empty answer
+                                # and the chat would render "(空回复)" instead of
+                                # what the engine actually said.
+                                raise RuntimeError(_engine_error_text(data["error"]))
                             delta = data.get("choices", [{}])[0].get("delta", {})
                             reasoning = delta.get("reasoning_content")
                             content = delta.get("content")
@@ -449,6 +455,31 @@ class TaskWorker(QObject):
             self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
+
+
+def _engine_error_text(raw: object) -> str:
+    """Unwrap the engine's error payload.
+
+    The 掬水 proxy reports an upstream failure as an SSE ``data:`` line inside a
+    200 stream, and the value it puts in ``error`` is the engine's whole response
+    body — itself JSON, double-encoded as a string. Show the inner ``message``
+    (``request (15535 tokens) exceeds the available context size (2048 tokens)``)
+    instead of a wall of escaped braces, but never lose the text: an error that
+    is not JSON is passed through verbatim.
+    """
+    text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+    try:
+        inner = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return text
+    if isinstance(inner, dict):
+        inner = inner.get("error", inner)
+        if isinstance(inner, dict):
+            for key in ("message", "detail", "code"):
+                value = inner.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return text
 
 
 class ChatStreamWorker(QObject):
