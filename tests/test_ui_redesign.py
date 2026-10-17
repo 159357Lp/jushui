@@ -4,6 +4,8 @@ Each test here locks a behaviour that was actually reached during the redesign,
 so a later edit cannot silently undo it:
 
 * the light/dark palettes stay in sync and keep the designed tokens;
+* the two stylesheets stay pure ``$token`` templates — a hard-coded colour would
+  make an image-derived theme impossible;
 * the sidebar stylesheet stays token-driven (it used to hard-code #192334);
 * i18n stays symmetric — several keys were added during the redesign and a
   half-added key only shows up in one language at runtime;
@@ -94,6 +96,90 @@ def test_dark_theme_untouched():
     assert _PALETTES["dark"]["bg"] == "#0d1117"
     assert _PALETTES["dark"]["surface"] == "#161b22"
     assert "background-color: #0d1117" in DARK_THEME
+
+
+# -------------------------------------------------------------------- templates
+#
+# The stylesheets are now ``string.Template`` bodies filled from a palette. That
+# is the prerequisite for an image-derived theme: a colour that is not a token
+# cannot be recoloured. These guards keep it that way.
+
+_HEX = re.compile(r"#[0-9a-fA-F]{3,8}\b")
+_WORD_COLOUR = re.compile(r"\b(?:white|black)\b")
+_COMMENT = re.compile(r"/\*.*?\*/", re.S)
+
+
+def _declarations(qss: str):
+    """Yield (selector, property, value) for real CSS, comments stripped."""
+    selector = "(root)"
+    for line in _COMMENT.sub("", qss).splitlines():
+        stripped = line.strip()
+        if stripped.endswith("{"):
+            selector = stripped.split("{")[0].strip()
+        elif stripped.endswith(";") and ":" in stripped:
+            prop, _, value = stripped.partition(":")
+            yield selector, prop.strip(), value.strip()
+
+
+def _hardcoded_colours(source: str):
+    return [(sel, prop, value) for sel, prop, value in _declarations(source)
+            if _HEX.search(value) or _WORD_COLOUR.search(value)]
+
+
+def test_colour_scanner_sees_a_planted_literal():
+    """Negative control for the guard below — if this scanner cannot report a
+    hard-coded colour, a clean run of the next test means nothing."""
+    assert _hardcoded_colours('QPushButton {\n    color: #FF0000;\n}') == [
+        ("QPushButton", "color", "#FF0000;")]
+    assert _hardcoded_colours('/* old: color: #FF0000 */\nQLabel {\n    color: white;\n}') == [
+        ("QLabel", "color", "white;")]
+
+
+@pytest.mark.parametrize("name", ["dark", "light"])
+def test_shipped_qss_has_no_hardcoded_colours(name):
+    import lmloader.gui.styles as styles
+
+    source = styles._DARK_QSS if name == "dark" else styles._LIGHT_QSS
+    assert not _hardcoded_colours(source), (
+        f"{name} stylesheet hard-codes colours again; add a token instead"
+    )
+
+
+@pytest.mark.parametrize("name", ["dark", "light"])
+def test_render_theme_reproduces_the_shipped_stylesheet(name):
+    """Templatizing was a refactor: the rendered QSS must not have moved."""
+    import lmloader.gui.styles as styles
+
+    shipped = styles.DARK_THEME if name == "dark" else styles.LIGHT_THEME
+    assert styles.render_theme(name) == shipped
+
+
+def test_render_theme_fails_loudly_on_an_incomplete_palette():
+    """A half-built custom palette must raise, not ship a half-coloured UI."""
+    import lmloader.gui.styles as styles
+
+    with pytest.raises(KeyError):
+        styles.Template("${no_such_token}").substitute(styles.theme_tokens("light"))
+
+
+def test_apply_theme_accepts_a_custom_palette(monkeypatch):
+    import lmloader.gui.styles as styles
+
+    monkeypatch.setattr(styles, "current_theme", "dark")
+    applied = []
+
+    class _App:
+        def setStyleSheet(self, qss):
+            applied.append(qss)
+
+    styles.apply_theme(_App(), "light", {"accent": "#FF0000"})
+    assert styles.current_theme == "custom"
+    assert styles._PALETTES["custom"]["accent"] == "#FF0000"
+    assert styles.c("accent") == "#FF0000", "inline page QSS would keep the old blue"
+    assert "#FF0000" in applied[0]
+
+    styles.apply_theme(_App(), "light")
+    assert applied[1] == styles.LIGHT_THEME, "apply_theme lost the cached stylesheet"
 
 
 # --------------------------------------------------------------------- sidebar
