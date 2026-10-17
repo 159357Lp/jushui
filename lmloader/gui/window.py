@@ -21,7 +21,7 @@ from lmloader.gui.pages.monitor import MonitorPage
 from lmloader.gui.pages.logs import LogsPage
 from lmloader.gui.styles import apply_theme, c as theme_color
 from lmloader.gui.icons import app_icon
-from lmloader.gui.ui_config import load_ui_setting, save_ui_setting
+from lmloader.gui.ui_config import load_ui_setting, save_ui_setting, active_theme
 
 
 SIDEBAR_WIDTH_EXPANDED = 200
@@ -87,7 +87,10 @@ class MainWindow(QMainWindow):
     def _on_theme_changed(self, theme: str):
         app = QApplication.instance()
         if app is not None:
-            apply_theme(app, theme)
+            # `theme` is only a reason to repaint; the palette itself is read back
+            # from config so a custom theme carries its 47 tokens instead of the
+            # bare name "custom", which styles.apply_theme would map to dark.
+            apply_theme(app, *active_theme())
         self._apply_sidebar_style()
         # Rebuild pages that embed theme colors in inline QSS.
         for page in (self.models_page, self.download_page):

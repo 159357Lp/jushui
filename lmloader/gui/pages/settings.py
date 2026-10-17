@@ -13,6 +13,7 @@ from pathlib import Path
 from lmloader.gui.api_client import LMLoaderAPI
 from lmloader.gui.i18n import tr, set_language
 from lmloader.gui.styles import c
+from lmloader.gui.theme_picker import CustomThemeRow
 
 
 def _get_config_path() -> Path:  # FIXED: G4
@@ -64,6 +65,7 @@ class SettingsPage(QWidget):
             self._build_engine_group(tr("settings.ternary_engine"), "ternary", with_update=True)
         )
 
+        right_col.addWidget(self._build_appearance_group())
         right_col.addWidget(self._build_server_group())
         right_col.addWidget(self._build_paths_group())
         right_col.addWidget(self._build_download_group())
@@ -575,6 +577,12 @@ class SettingsPage(QWidget):
         form.addRow("", auto_unload)
         self.auto_unload = auto_unload
 
+        return group
+
+    def _build_appearance_group(self) -> QGroupBox:
+        group = QGroupBox(tr("settings.appearance"))
+        form = QFormLayout(group)
+
         lang_combo = QComboBox()
         lang_combo.addItem(tr("settings.lang_zh"), "zh")
         lang_combo.addItem(tr("settings.lang_en"), "en")
@@ -584,10 +592,23 @@ class SettingsPage(QWidget):
         theme_combo = QComboBox()
         theme_combo.addItem(tr("settings.theme_dark"), "dark")
         theme_combo.addItem(tr("settings.theme_light"), "light")
+        theme_combo.addItem(tr("settings.theme_custom"), "custom")
         form.addRow(tr("settings.theme"), theme_combo)
         self.theme_combo = theme_combo
 
+        # The picker writes ui.custom_theme and switches immediately; keeping the
+        # combo in sync is what stops 保存设置 from quietly dropping back to dark.
+        self.theme_row = CustomThemeRow()
+        self.theme_row.theme_applied.connect(self._on_custom_theme)
+        form.addRow(tr("settings.custom_theme"), self.theme_row)
+
         return group
+
+    def _on_custom_theme(self, theme: str):
+        index = self.theme_combo.findData(theme)
+        if index >= 0:
+            self.theme_combo.setCurrentIndex(index)
+        self.theme_changed.emit(theme)
 
     def _build_paths_group(self) -> QGroupBox:
         group = QGroupBox(tr("settings.paths"))
@@ -819,11 +840,14 @@ class SettingsPage(QWidget):
         ui["theme"] = self.theme_combo.currentData() or "dark"
         config["ui"] = ui
         set_language(config["ui"]["language"])
-        self.theme_changed.emit(config["ui"]["theme"])
 
         try:
             with open(self._config_path, "w", encoding="utf-8") as f:
                 yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+            # Emit only once the file holds the new value: the window resolves a
+            # "custom" theme by reading ui.custom_theme back off disk, and a save
+            # that failed midway would repaint from the palette it just rejected.
+            self.theme_changed.emit(config["ui"]["theme"])
             QMessageBox.information(self, tr("settings.saved_title"), tr("settings.saved_msg"))
         except Exception as e:
             QMessageBox.critical(self, tr("settings.error_title"), tr("settings.save_error").format(err=e))
