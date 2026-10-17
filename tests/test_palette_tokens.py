@@ -7,10 +7,12 @@ Qt 的 ``QColor`` 把 8 位十六进制读成 **#AARRGGBB**，不是 CSS 的 #RR
 
 * 两套内置调色板的每个令牌都是 #RRGGBB，且 Qt 解析出来的就是字面那三个通道；
 * 页面源码里不再出现"颜色后面拼两位十六进制"的写法；
-* ``styles.tint()`` 混色确实落在底衬与目标色之间，并跟随当前（含自定义）调色板。
+* ``styles.tint()`` 混色确实落在底衬与目标色之间，并跟随当前（含自定义）调色板；
+* ``apply_theme()`` 除了样式表还要下发 QPalette —— 两套模板都没点名 QDialog /
+  QMessageBox / 裸 QWidget，没有调色板它们就一直画系统浅灰。
 
-反向对照在 ``test_alpha_suffix_guard_fires_on_a_planted_style``：往源码里种一条
-``{c('green')}66``，守卫必须抓到它。
+反向对照有两条：往源码里种一条 ``{c('green')}66``，守卫必须抓到它；把应用调色板退回
+系统默认，弹窗像素探针必须报红。
 """
 
 import re
@@ -83,14 +85,29 @@ def test_alpha_suffix_guard_fires_on_a_planted_style():
 
 @pytest.fixture
 def palette_restored():
-    """These tests poke the live theme globals; put them back exactly as found."""
-    saved_theme, saved_custom = styles.current_theme, _PALETTES.get("custom")
+    """These tests poke the live theme globals *and* the QApplication; put every
+    one of them back exactly as found."""
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    saved = (styles.current_theme, _PALETTES.get("custom"),
+             app.palette() if app is not None else None,
+             app.styleSheet() if app is not None else None)
     yield
-    styles.current_theme = saved_theme
-    if saved_custom is None:
+    styles.current_theme, custom, palette, sheet = saved
+    if custom is None:
         _PALETTES.pop("custom", None)
     else:
-        _PALETTES["custom"] = saved_custom
+        _PALETTES["custom"] = custom
+    if app is not None:
+        app.setPalette(palette)
+        app.setStyleSheet(sheet)
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    from PySide6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
 
 
 @pytest.mark.parametrize("base", ["dark", "light"])
@@ -115,3 +132,49 @@ def test_tint_follows_a_custom_palette(palette_restored):
     styles.current_theme = "custom"
     assert tint("accent", 0.5) == "#800000"
     assert tint("#00FF00", 0.25, over="accent") == "#BF4000"
+
+
+# ------------------------------------------------ 样式表没点名的控件（弹窗那一类）
+
+def _corner(widget) -> str:
+    img = widget.grab().toImage()
+    px = img.pixelColor(6, 6)
+    return f"#{px.red():02X}{px.green():02X}{px.blue():02X}".upper()
+
+
+@pytest.mark.parametrize("base", ["dark", "light"])
+def test_apply_theme_publishes_a_matching_qpalette(base, qapp, palette_restored):
+    from PySide6.QtGui import QPalette
+
+    styles.apply_theme(qapp, base)
+    role, group = QPalette.ColorRole, QPalette.ColorGroup
+    for role_name, token in (("Window", "bg"), ("Base", "bg"), ("Text", "fg"),
+                             ("WindowText", "fg"), ("Button", "btn"), ("Highlight", "accent"),
+                             ("HighlightedText", "on_accent"), ("ToolTipBase", "surface"),
+                             ("PlaceholderText", "dim")):
+        got = getattr(role, role_name)
+        assert qapp.palette().color(got).name().upper() == c(token).upper(), role_name
+    assert qapp.palette().color(group.Disabled, role.Text).name().upper() == c("dim").upper()
+
+
+def test_dialogs_paint_the_theme_background(qapp, palette_restored):
+    """The bug no stylesheet assertion could see: QDialog / QMessageBox aren't named
+    in either template, so they painted the platform's light grey in the dark theme."""
+    from PySide6.QtGui import QPalette
+    from PySide6.QtWidgets import QDialog, QMessageBox, QWidget
+
+    styles.apply_theme(qapp, "dark")
+    want = c("bg").upper()
+    for widget in (QMessageBox(), QDialog(), QWidget()):
+        widget.resize(320, 160)
+        assert _corner(widget) == want, type(widget).__name__
+
+    # 反向对照：退回"只下发样式表"的状态（系统默认调色板），探针必须报红
+    probe = QMessageBox()
+    probe.resize(320, 160)
+    saved = qapp.palette()
+    qapp.setPalette(QPalette())
+    try:
+        assert _corner(probe) != want, "系统默认调色板也画出了 bg —— 这个探针测不出问题"
+    finally:
+        qapp.setPalette(saved)

@@ -164,19 +164,26 @@ def test_render_theme_fails_loudly_on_an_incomplete_palette():
 
 def test_apply_theme_accepts_a_custom_palette(monkeypatch):
     import lmloader.gui.styles as styles
+    from PySide6.QtGui import QPalette
 
     monkeypatch.setattr(styles, "current_theme", "dark")
-    applied = []
+    applied, palettes = [], []
 
     class _App:
         def setStyleSheet(self, qss):
             applied.append(qss)
+
+        def setPalette(self, palette):
+            palettes.append(palette)
 
     styles.apply_theme(_App(), "light", {"accent": "#FF0000"})
     assert styles.current_theme == "custom"
     assert styles._PALETTES["custom"]["accent"] == "#FF0000"
     assert styles.c("accent") == "#FF0000", "inline page QSS would keep the old blue"
     assert "#FF0000" in applied[0]
+    # Dialogs and tooltips are outside the QSS templates; they only see the
+    # palette, so a custom accent has to reach it too.
+    assert palettes[0].color(QPalette.ColorRole.Highlight).name().upper() == "#FF0000"
 
     styles.apply_theme(_App(), "light")
     assert applied[1] == styles.LIGHT_THEME, "apply_theme lost the cached stylesheet"

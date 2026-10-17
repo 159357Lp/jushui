@@ -988,6 +988,39 @@ LIGHT_THEME = render_theme("light")
 THEMES = {"dark": DARK_THEME, "light": LIGHT_THEME}
 
 
+def build_palette(tokens: dict):
+    """The token map as a ``QPalette`` — the stylesheet's blind spot.
+
+    QSS only reaches the classes it names, and ``QDialog``/``QMessageBox``/``QMenu``/
+    ``QToolTip`` are not in either template, so they fall back to the platform
+    palette: a warning dialog painted #f3f3f3 in the dark theme. Whatever the
+    stylesheet does not claim, the palette now covers.
+    """
+    from PySide6.QtGui import QColor, QPalette
+
+    role, group = QPalette.ColorRole, QPalette.ColorGroup
+
+    def colour(name: str):
+        return QColor(tokens[name])
+
+    palette = QPalette()
+    pairs = (
+        (role.Window, "bg"), (role.Base, "bg"), (role.Button, "btn"),
+        (role.WindowText, "fg"), (role.Text, "fg"), (role.ButtonText, "fg"),
+        (role.ToolTipBase, "surface"), (role.ToolTipText, "fg"),
+        (role.Highlight, "accent"), (role.HighlightedText, "on_accent"),
+        (role.Link, "accent"), (role.LinkVisited, "accent"),
+        (role.PlaceholderText, "dim"), (role.BrightText, "red"),
+    )
+    for target, token in pairs:
+        palette.setColor(target, colour(token))
+    # A disabled control must not read as enabled: the shipped themes all have a
+    # dedicated "dim" token for exactly this.
+    for target in (role.WindowText, role.Text, role.ButtonText):
+        palette.setColor(group.Disabled, target, colour("dim"))
+    return palette
+
+
 def apply_theme(app, name: str, overrides: dict | None = None):
     """Switch the running app's theme; safe to call anytime.
 
@@ -997,10 +1030,13 @@ def apply_theme(app, name: str, overrides: dict | None = None):
     """
     global current_theme
     if overrides:
-        _PALETTES["custom"] = theme_tokens(name, overrides)
+        tokens = theme_tokens(name, overrides)
+        _PALETTES["custom"] = tokens
         current_theme = "custom"
         app.setStyleSheet(render_theme(name, overrides))
+        app.setPalette(build_palette(tokens))
         return
     name = name if name in THEMES else "dark"
     current_theme = name
     app.setStyleSheet(THEMES[name])
+    app.setPalette(build_palette(theme_tokens(name)))
