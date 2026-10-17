@@ -24,7 +24,7 @@ from lmloader.gui.api_client import (
 from lmloader.gui.icons import copy_icon, download_icon
 from lmloader.gui.i18n import tr
 from lmloader.gui.repetition import detect_repetition_loop
-from lmloader.gui.styles import c, tint
+from lmloader.gui.styles import c, canvas, tint
 from lmloader.gui.ui_config import load_ui_setting, save_ui_setting
 from lmloader.infra.chat_db import chat_db
 
@@ -308,7 +308,7 @@ class ChatPage(QWidget):
         sidebar.setMinimumWidth(210)
         self._bind_style(
             sidebar,
-            lambda: f"QWidget#chatSidebar {{ background-color: {c('surface')};"
+            lambda: f"QWidget#chatSidebar {{ background-color: {canvas('surface')};"
                     f" border-right: 1px solid {c('border')}; }}",
         )
         layout = QVBoxLayout(sidebar)
@@ -414,8 +414,8 @@ class ChatPage(QWidget):
         self.chat_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._bind_style(
             self.chat_scroll,
-            lambda: f"QScrollArea#chatDisplay {{ background-color: {c('bg')}; border: none; }}"
-                    f" QScrollArea#chatDisplay QWidget#chatMessages {{ background-color: {c('bg')}; }}",
+            lambda: f"QScrollArea#chatDisplay {{ background-color: {canvas('bg')}; border: none; }}"
+                    f" QScrollArea#chatDisplay QWidget#chatMessages {{ background-color: {canvas('bg')}; }}",
         )
         self.chat_messages = QWidget()
         self.chat_messages.setObjectName("chatMessages")
@@ -429,7 +429,7 @@ class ChatPage(QWidget):
         composer.setObjectName("chatComposer")
         self._bind_style(
             composer,
-            lambda: f"QWidget#chatComposer {{ background-color: {c('surface')};"
+            lambda: f"QWidget#chatComposer {{ background-color: {canvas('surface')};"
                     f" border: 1px solid {c('border')}; border-radius: 12px; }}",
         )
         composer_layout = QVBoxLayout(composer)

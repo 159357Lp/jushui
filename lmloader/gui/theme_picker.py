@@ -312,7 +312,7 @@ class CustomThemeRow(QWidget):
         self._strength = QSlider(Qt.Horizontal)
         self._strength.setRange(0, 100)
         self._panel = QSlider(Qt.Horizontal)
-        self._panel.setRange(35, 100)
+        self._panel.setRange(0, 100)
         self._readouts = {}
         for row, (key, slider) in enumerate((
                 ("settings.wallpaper_strength", self._strength),

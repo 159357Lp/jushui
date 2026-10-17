@@ -135,11 +135,25 @@ def c(name: str) -> str:
 
 
 WALLPAPER_ROLES = ("bg", "surface", "surface_hover", "bubble_user", "chip_bg")
-"""Tokens that become translucent while a background picture is painted.
+"""Tokens the 面板不透明度 slider washes while a background picture is painted.
 
-Only the big canvases: text, borders and accent chips stay solid, so the
-picture reads as scenery behind the UI rather than noise under every glyph.
+These are the cards: bubbles, the composer, inputs, chips, hovers. Sliding them
+down is the frosted look; at 100% they are solid and the picture is only
+visible where nothing covers it. Text colours, borders and accents never wash.
 """
+
+CANVAS_ROLES = ("bg", "surface")
+"""Container fills that go fully see-through so the picture reads as the page.
+
+Which widget is a *container* is not something a token can say — ``bg`` is also
+the QLineEdit/QComboBox/QTableWidget fill — so pages ask :func:`canvas` for
+their own backgrounds instead of ``c()``.
+"""
+
+
+def canvas(role: str) -> str:
+    """`role`'s colour, or `transparent` while a picture is painted behind it."""
+    return "transparent" if (_wallpaper and role in CANVAS_ROLES) else c(role)
 
 
 def hexify(value: str) -> str:
@@ -153,7 +167,7 @@ def hexify(value: str) -> str:
 
 
 def with_panel_alpha(tokens: dict, alpha: float) -> dict:
-    """The paint view of a palette: big surfaces at `alpha`, everything else solid.
+    """The paint view of a palette: the page canvas at `alpha`, every card solid.
 
     QSS gets the ``rgba()`` **function** form on purpose. An 8-digit hex would be
     read by Qt as ``#AARRGGBB`` — see ``tint`` — and the palette API can't carry
@@ -1069,7 +1083,7 @@ def set_wallpaper(state: dict | None):
     _wallpaper = None if not state or not state.get("enabled") or not state.get("source") else {
         "source": str(state["source"]),
         "strength": min(max(float(state.get("strength", 0.55)), 0.0), 1.0),
-        "panel_alpha": min(max(float(state.get("panel_alpha", 0.72)), 0.35), 1.0),
+        "panel_alpha": min(max(float(state.get("panel_alpha", 0.72)), 0.0), 1.0),
     }
     return _wallpaper
 

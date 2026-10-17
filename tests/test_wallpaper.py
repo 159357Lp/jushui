@@ -5,8 +5,10 @@
 * 透明度只能走 ``rgba()`` 函数式写法和 ``QPainter.setOpacity``——八位十六进制会被
   Qt 读成 ``#AARRGGBB``（见 styles.tint 的注释），一旦有人图省事拼 ``bg + "b3"``，
   整窗颜色会串成另一种色；
-* 只有大块画布（bg/surface/surface_hover/bubble_user/chip_bg）变半透明，文字、
-  边框、强调色必须保持实色，否则正文跟着画一起虚掉；
+* 滑块洗的是卡片（bg/surface/surface_hover/bubble_user/chip_bg），文字、边框、
+  强调色必须保持实色，否则正文跟着画一起虚掉；
+* 容器（正文区、历史栏、输入区外壳）走 styles.canvas()：铺了画就全透，
+  这样没对话时看到的就是画本身，气泡照样把它挡住；
 * QPalette 拿不到 alpha（``QColor`` 不认 ``rgba()``），弹窗那一层继续用实色；
 * 滑块的百分比要能落盘、能重启恢复，且绝不把 tokens 写丢。
 
@@ -59,10 +61,18 @@ def theme_with_picture(scratch, picture):
     return {"base": ex.base, "tokens": ex.tokens, "source": stored}
 
 
-@pytest.fixture
-def palette_restored():
-    """apply_theme 改的是全局；每个用例结束后原样放回。"""
+@pytest.fixture(autouse=True)
+def palette_restored(qapp):        # 依赖 qapp：这样每个用例都一定抓得到那个实例
+    """apply_theme 改的是全局；每个用例结束后原样放回。
+
+    autouse 是必须的：滑块的即时预览会走真的 QApplication.setStyleSheet，
+    漏一个用例，后面任何量尺寸、读 c() 的用例都在测另一套主题。
+    """
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
     theme, custom, state = styles.current_theme, styles._PALETTES.get("custom"), styles.wallpaper_state()
+    sheet = app.styleSheet() if app is not None else ""
     yield
     styles.current_theme = theme
     if custom is None:
@@ -70,6 +80,8 @@ def palette_restored():
     else:
         styles._PALETTES["custom"] = custom
     styles.set_wallpaper(state)
+    if app is not None and app.styleSheet() != sheet:
+        app.setStyleSheet(sheet)
 
 
 class FakeApp:
@@ -86,7 +98,8 @@ class FakeApp:
 
 # ---------------------------------------------------------------- 令牌 → 该画成什么
 
-def test_panel_alpha_only_softens_the_big_canvases():
+def test_panel_alpha_only_softens_the_cards():
+    """滑块洗的是卡片（气泡/输入/标签/悬停），文字边框强调色一律实色。"""
     tokens = styles.theme_tokens("light")
     paint = styles.with_panel_alpha(tokens, 0.72)
     for role in styles.WALLPAPER_ROLES:
@@ -94,6 +107,29 @@ def test_panel_alpha_only_softens_the_big_canvases():
     for role in ("fg", "title", "border", "accent", "sidebar", "muted"):
         assert HEX6.match(paint[role]), f"{role} 被洗成半透明了，正文会跟着虚"
     assert paint["fg"] == tokens["fg"]
+
+
+def test_canvas_goes_see_through_only_while_a_picture_is_painted(palette_restored, qapp):
+    """容器问 canvas()，卡片问 c()：没铺画时两者必须完全一样。"""
+    styles.set_wallpaper(None)
+    assert styles.canvas("bg") == styles.c("bg")
+    assert styles.canvas("surface") == styles.c("surface")
+    styles.set_wallpaper({"enabled": True, "source": "x.png",
+                          "strength": 0.55, "panel_alpha": 1.0})
+    assert styles.canvas("bg") == "transparent", "铺了画容器还不透，正文区就是一片纯色"
+    assert styles.canvas("surface") == "transparent"
+    assert styles.c("bg") != "transparent", "卡片不能跟着一起透"
+    styles.set_wallpaper(None)
+
+
+def test_chat_containers_ask_canvas_not_c():
+    """静态守卫：聊天页那三个容器一旦改回 c()，背景层就又看不见了。"""
+    src = Path(styles.__file__).with_name("pages").joinpath("chat.py").read_text(encoding="utf-8")
+    for needle in ("QWidget#chatSidebar {{ background-color: {canvas('surface')}",
+                   "QScrollArea#chatDisplay {{ background-color: {canvas('bg')}",
+                   "chatMessages {{ background-color: {canvas('bg')}",
+                   "QWidget#chatComposer {{ background-color: {canvas('surface')}"):
+        assert needle in src, f"容器样式改回实色了：{needle}"
 
 
 def test_alpha_is_spelled_as_rgba_never_eight_digit_hex():
@@ -146,7 +182,7 @@ def test_turning_the_wallpaper_off_restores_solid_everywhere(palette_restored):
 def test_applying_a_picture_theme_turns_the_wallpaper_on(theme_with_picture):
     cfg = ui_config.load_wallpaper()
     assert cfg["enabled"] is True
-    assert cfg["strength"] == 55 and cfg["panel_alpha"] == 72
+    assert cfg["strength"] == 55 and cfg["panel_alpha"] == 100
     state = ui_config.wallpaper_state()
     assert state["source"] == str(theme_with_picture["source"])
     assert state["strength"] == pytest.approx(0.55)
@@ -163,9 +199,9 @@ def test_wallpaper_write_keeps_the_palette_tokens(theme_with_picture):
 
 
 @pytest.mark.parametrize("raw,expect", [
-    ({"enabled": True, "strength": 500, "panel_alpha": 5}, (100, 35)),   # 越界要夹住
-    ({"enabled": True, "strength": "abc", "panel_alpha": None}, (55, 72)),  # 坏值回落默认
-    ({"strength": 30}, (30, 72)),                                        # 缺字段补默认
+    ({"enabled": True, "strength": 500, "panel_alpha": -20}, (100, 0)),   # 越界要夹住
+    ({"enabled": True, "strength": "abc", "panel_alpha": None}, (55, 100)),  # 坏值回落默认
+    ({"strength": 30}, (30, 100)),                                        # 缺字段补默认
 ])
 def test_wallpaper_settings_are_normalised(scratch, theme_with_picture, raw, expect):
     custom = ui_config.load_custom_theme()
@@ -247,15 +283,18 @@ def test_sliders_preview_then_commit(theme_with_picture, qapp, monkeypatch):
 
     row = CustomThemeRow()
     assert row._wp_enable.isChecked(), "取色后背景层默认就该开着"
-    assert row._strength.value() == 55 and row._panel.value() == 72
+    assert row._strength.value() == 55 and row._panel.value() == 100
     assert row._readouts[row._strength].text() == "55%"
 
     row._strength.setValue(30)
     assert row._readouts[row._strength].text() == "30%"
-    assert styles.c("bg").startswith("rgba("), "拖动过程中界面没跟着变"
+    assert styles.wallpaper_state()["strength"] == pytest.approx(0.30), "拖动过程中界面没跟着变"
     assert ui_config.load_wallpaper()["strength"] == 55, "还在拖就先写了盘"
     QTest.qWait(600)                       # 等 400ms 防抖落盘
     assert ui_config.load_wallpaper()["strength"] == 30
+
+    row._panel.setValue(60)                # 卡片一旦调虚，QSS 必须出现 rgba()
+    assert styles.c("bg").startswith("rgba(") and styles.c("bubble_user").startswith("rgba(")
 
     emitted = []
     row.theme_applied.connect(emitted.append)

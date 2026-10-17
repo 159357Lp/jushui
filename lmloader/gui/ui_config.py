@@ -78,15 +78,15 @@ def save_custom_theme(base: str, source: str, tokens: dict, contrast=(), wallpap
                                      "tokens": tokens})
 
 
-WALLPAPER_DEFAULTS = {"enabled": False, "strength": 55, "panel_alpha": 72}
+WALLPAPER_DEFAULTS = {"enabled": False, "strength": 55, "panel_alpha": 100}
 
 
 def _normalise_wallpaper(raw) -> dict:
-    """夹住越界和坏值：面板不透明度最低 35%，再低正文就没法读了。"""
+    """夹住越界和坏值：面板不透明度最低 0%（画布全透，只剩卡片是实的）。"""
     out = dict(WALLPAPER_DEFAULTS)
     if not isinstance(raw, dict):
         return out
-    for key, floor in (("strength", 0), ("panel_alpha", 35)):
+    for key, floor in (("strength", 0), ("panel_alpha", 0)):
         try:
             out[key] = min(max(int(raw.get(key, out[key])), floor), 100)
         except (TypeError, ValueError):
@@ -112,7 +112,7 @@ def save_wallpaper(enabled: bool | None = None, strength: int | None = None,
     if strength is not None:
         current["strength"] = min(max(int(strength), 0), 100)
     if panel_alpha is not None:
-        current["panel_alpha"] = min(max(int(panel_alpha), 35), 100)
+        current["panel_alpha"] = min(max(int(panel_alpha), 0), 100)
     save_custom_theme(custom["base"], custom["source"], custom["tokens"],
                       custom["contrast"], current)
     return current
