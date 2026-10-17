@@ -67,12 +67,70 @@ def load_custom_theme() -> dict:
     return {"base": raw.get("base") or "dark",
             "source": raw.get("source") or "",
             "contrast": raw.get("contrast") or [],
+            "wallpaper": raw.get("wallpaper") or {},
             "tokens": tokens}
 
 
-def save_custom_theme(base: str, source: str, tokens: dict, contrast=()):
+def save_custom_theme(base: str, source: str, tokens: dict, contrast=(), wallpaper=None):
     save_ui_setting("custom_theme", {"base": base, "source": source,
-                                     "contrast": list(contrast), "tokens": tokens})
+                                     "contrast": list(contrast),
+                                     "wallpaper": dict(wallpaper or {}),
+                                     "tokens": tokens})
+
+
+WALLPAPER_DEFAULTS = {"enabled": False, "strength": 55, "panel_alpha": 72}
+
+
+def _normalise_wallpaper(raw) -> dict:
+    """夹住越界和坏值：面板不透明度最低 35%，再低正文就没法读了。"""
+    out = dict(WALLPAPER_DEFAULTS)
+    if not isinstance(raw, dict):
+        return out
+    for key, floor in (("strength", 0), ("panel_alpha", 35)):
+        try:
+            out[key] = min(max(int(raw.get(key, out[key])), floor), 100)
+        except (TypeError, ValueError):
+            pass
+    out["enabled"] = bool(raw.get("enabled", False))
+    return out
+
+
+def load_wallpaper() -> dict:
+    """The raw background-picture settings (percent scale, always a full dict)."""
+    return _normalise_wallpaper(load_custom_theme().get("wallpaper"))
+
+
+def save_wallpaper(enabled: bool | None = None, strength: int | None = None,
+                   panel_alpha: int | None = None) -> dict:
+    """Merge new wallpaper settings into the stored theme, tokens and all."""
+    custom = load_custom_theme()
+    if not custom:
+        return {}
+    current = _normalise_wallpaper(custom.get("wallpaper"))
+    if enabled is not None:
+        current["enabled"] = bool(enabled)
+    if strength is not None:
+        current["strength"] = min(max(int(strength), 0), 100)
+    if panel_alpha is not None:
+        current["panel_alpha"] = min(max(int(panel_alpha), 35), 100)
+    save_custom_theme(custom["base"], custom["source"], custom["tokens"],
+                      custom["contrast"], current)
+    return current
+
+
+def wallpaper_state(custom: dict | None = None) -> dict | None:
+    """What :func:`styles.apply_theme` needs, or None when there is no picture.
+
+    A theme without a source image can't paint scenery, and a disabled switch
+    must not leave a half-translucent UI behind — both return None so the caller
+    falls back to solid surfaces.
+    """
+    custom = load_custom_theme() if custom is None else custom
+    cfg = _normalise_wallpaper(custom.get("wallpaper"))
+    if not custom.get("source") or not cfg["enabled"]:
+        return None
+    return {"enabled": True, "source": custom["source"],
+            "strength": cfg["strength"] / 100, "panel_alpha": cfg["panel_alpha"] / 100}
 
 
 def active_theme() -> tuple[str, dict | None]:
@@ -89,4 +147,14 @@ def active_theme() -> tuple[str, dict | None]:
             return custom["base"], custom["tokens"]
         return "dark", None
     return (theme if theme in ("dark", "light") else "dark"), None
+
+
+def theme_request() -> tuple[str, dict | None, dict | None]:
+    """Everything ``styles.apply_theme`` wants, in one call from one reader.
+
+    A background picture only exists for an image-derived palette, so the
+    wallpaper is dropped whenever the tokens came from the built-in theme.
+    """
+    base, overrides = active_theme()
+    return base, overrides, (wallpaper_state() if overrides else None)
 

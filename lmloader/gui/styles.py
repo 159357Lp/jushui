@@ -134,6 +134,43 @@ def c(name: str) -> str:
     return _PALETTES[current_theme].get(name, _PALETTES["dark"].get(name, "#000000"))
 
 
+WALLPAPER_ROLES = ("bg", "surface", "surface_hover", "bubble_user", "chip_bg")
+"""Tokens that become translucent while a background picture is painted.
+
+Only the big canvases: text, borders and accent chips stay solid, so the
+picture reads as scenery behind the UI rather than noise under every glyph.
+"""
+
+
+def hexify(value: str) -> str:
+    """`rgba(r, g, b, a)` / `#RGB` / `#RRGGBB` → `#RRGGBB`, alpha dropped."""
+    if value.startswith("rgba("):
+        r, g, b = (int(part) for part in value[5:-1].split(",")[:3])
+        return f"#{r:02X}{g:02X}{b:02X}"
+    if value.startswith("#") and len(value) == 4:
+        return "#" + "".join(ch * 2 for ch in value[1:])
+    return value
+
+
+def with_panel_alpha(tokens: dict, alpha: float) -> dict:
+    """The paint view of a palette: big surfaces at `alpha`, everything else solid.
+
+    QSS gets the ``rgba()`` **function** form on purpose. An 8-digit hex would be
+    read by Qt as ``#AARRGGBB`` — see ``tint`` — and the palette API can't carry
+    alpha at all, so this dict is for stylesheets only.
+    """
+    if alpha >= 1.0:
+        return dict(tokens)
+    out = dict(tokens)
+    for role in WALLPAPER_ROLES:
+        value = out.get(role)
+        if not value:
+            continue
+        r, g, b = (int(value[i:i + 2], 16) for i in (1, 3, 5))
+        out[role] = f"rgba({r}, {g}, {b}, {alpha:g})"
+    return out
+
+
 def tint(colour: str, alpha: float, over: str = "bg") -> str:
     """`colour` washed over palette colour `over`, returned as a solid #RRGGBB.
 
@@ -143,7 +180,8 @@ def tint(colour: str, alpha: float, over: str = "bg") -> str:
     `colour` may be a token name or a literal hex.
     """
     def rgb(value: str) -> tuple[int, int, int]:
-        value = value if value.startswith("#") else c(value)
+        value = value if value.startswith(("#", "rgba(")) else c(value)
+        value = hexify(value)
         return tuple(int(value[i:i + 2], 16) for i in (1, 3, 5))  # type: ignore[return-value]
 
     base, top = rgb(over), rgb(colour)
@@ -973,14 +1011,15 @@ def theme_tokens(name: str = "dark", overrides: dict | None = None) -> dict:
     return tokens
 
 
-def render_theme(name: str = "dark", overrides: dict | None = None) -> str:
+def render_theme(name: str = "dark", overrides: dict | None = None,
+                 panel_alpha: float = 1.0) -> str:
     """Fill the stylesheet template with a palette.
 
     Raises KeyError if a token the template needs is missing, so a half-built
     custom palette fails loudly instead of shipping a half-coloured UI.
     """
     template = _QSS_TEMPLATES.get(name, _QSS_TEMPLATES["dark"])
-    return template.substitute(theme_tokens(name, overrides))
+    return template.substitute(with_panel_alpha(theme_tokens(name, overrides), panel_alpha))
 
 
 DARK_THEME = render_theme("dark")
@@ -1021,22 +1060,45 @@ def build_palette(tokens: dict):
     return palette
 
 
-def apply_theme(app, name: str, overrides: dict | None = None):
+_wallpaper: dict | None = None
+
+
+def set_wallpaper(state: dict | None):
+    """Remember the active background picture for the paint layer and the sliders."""
+    global _wallpaper
+    _wallpaper = None if not state or not state.get("enabled") or not state.get("source") else {
+        "source": str(state["source"]),
+        "strength": min(max(float(state.get("strength", 0.55)), 0.0), 1.0),
+        "panel_alpha": min(max(float(state.get("panel_alpha", 0.72)), 0.35), 1.0),
+    }
+    return _wallpaper
+
+
+def wallpaper_state() -> dict | None:
+    return _wallpaper
+
+
+def apply_theme(app, name: str, overrides: dict | None = None, wallpaper: dict | None = None):
     """Switch the running app's theme; safe to call anytime.
 
     `overrides` lets a custom palette ride on top of `name`'s base shape. The
     merged palette is published as "custom" so c() and the rail QSS in
     window.py resolve exactly the colours the stylesheet was rendered with.
+
+    `wallpaper` turns on the background picture: the big surface tokens go
+    translucent (``panel_alpha``) so the image painted by ``WallpaperHost`` reads
+    through them, while text, borders and accents stay solid.
     """
     global current_theme
-    if overrides:
-        tokens = theme_tokens(name, overrides)
-        _PALETTES["custom"] = tokens
+    state = set_wallpaper(wallpaper)
+    panel = state["panel_alpha"] if state else 1.0
+    hex_tokens = theme_tokens(name, overrides)
+    if overrides or panel < 1.0:
+        _PALETTES["custom"] = with_panel_alpha(hex_tokens, panel)
         current_theme = "custom"
-        app.setStyleSheet(render_theme(name, overrides))
-        app.setPalette(build_palette(tokens))
-        return
-    name = name if name in THEMES else "dark"
-    current_theme = name
-    app.setStyleSheet(THEMES[name])
-    app.setPalette(build_palette(theme_tokens(name)))
+    else:
+        current_theme = name if name in THEMES else "dark"
+    app.setStyleSheet(render_theme(name, overrides, panel))
+    # The QPalette can't carry alpha through QColor("#…"), and it only ever backs
+    # dialogs/menus — those stay solid even when the main window is frosted.
+    app.setPalette(build_palette(hex_tokens))

@@ -12,18 +12,21 @@ import hashlib
 import shutil
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
-    QDialog, QFileDialog, QGridLayout, QHBoxLayout, QLabel, QMessageBox,
-    QPushButton, QRadioButton, QVBoxLayout, QWidget,
+    QCheckBox, QDialog, QFileDialog, QGridLayout, QHBoxLayout, QLabel, QMessageBox,
+    QPushButton, QRadioButton, QSlider, QVBoxLayout, QWidget,
 )
 
+from lmloader.gui import styles
 from lmloader.gui.i18n import tr
 from lmloader.gui.styles import c
 from lmloader.gui.ui_config import (
-    load_custom_theme, save_custom_theme, save_ui_setting, theme_dir,
+    WALLPAPER_DEFAULTS, load_custom_theme, load_wallpaper, save_custom_theme,
+    save_ui_setting, save_wallpaper, theme_dir,
 )
+from lmloader.gui.wallpaper import preview_wallpaper
 
 # The 12 colours worth showing a human; the other 35 are derived from these and
 # only differ in one wash step, so a 47-cell grid would be a wall of near-dupes.
@@ -251,7 +254,9 @@ def apply_palette(source: Path, ex) -> Path:
     extractor just to draw a label.
     """
     stored = store_source(source)
-    save_custom_theme(ex.base, str(stored), ex.tokens, contrast_score(ex))
+    # 新取的图默认就当背景铺开（55% 浓度 / 72% 面板不透明度），滑块随时可关。
+    save_custom_theme(ex.base, str(stored), ex.tokens, contrast_score(ex),
+                      {**WALLPAPER_DEFAULTS, "enabled": True})
     save_ui_setting("theme", "custom")
     return stored
 
@@ -295,7 +300,85 @@ class CustomThemeRow(QWidget):
         self._hint = _hint("")
         self._hint.setWordWrap(True)
         layout.addWidget(self._hint)
+
+        # 背景图层：底图浓度 + 面板不透明度，两条滑块各管一层。
+        self._wp_box = QWidget()
+        grid = QGridLayout(self._wp_box)
+        grid.setContentsMargins(0, 4, 0, 0)
+        grid.setHorizontalSpacing(8)
+        self._wp_enable = QCheckBox(tr("settings.wallpaper_enable"))
+        self._wp_enable.toggled.connect(self._on_wp_toggle)
+        grid.addWidget(self._wp_enable, 0, 0, 1, 3)
+        self._strength = QSlider(Qt.Horizontal)
+        self._strength.setRange(0, 100)
+        self._panel = QSlider(Qt.Horizontal)
+        self._panel.setRange(35, 100)
+        self._readouts = {}
+        for row, (key, slider) in enumerate((
+                ("settings.wallpaper_strength", self._strength),
+                ("settings.panel_alpha", self._panel)), start=1):
+            grid.addWidget(QLabel(tr(key)), row, 0)
+            grid.addWidget(slider, row, 1)
+            readout = _hint("")
+            readout.setMinimumWidth(38)
+            grid.addWidget(readout, row, 2)
+            self._readouts[slider] = readout
+            slider.valueChanged.connect(self._on_wp_slide)
+        layout.addWidget(self._wp_box)
+
+        # 拖动时只预览；停手 400ms 才落盘，避免每格都重写配置和重建页面。
+        self._commit_timer = QTimer(self)
+        self._commit_timer.setSingleShot(True)
+        self._commit_timer.setInterval(400)
+        self._commit_timer.timeout.connect(self._commit_wallpaper)
+
         self.refresh()
+
+    # ------------------------------------------------------------- 背景图层
+    def _wp_source(self) -> str:
+        source = self._stored_source()
+        return str(source) if source else ""
+
+    def _sync_wallpaper(self):
+        cfg = load_wallpaper()
+        source = self._wp_source()
+        available = bool(source)
+        self._wp_box.setVisible(bool(self.custom().get("tokens")))
+        for slider in (self._strength, self._panel):
+            slider.setEnabled(available and cfg["enabled"])
+        widgets = (self._wp_enable, self._strength, self._panel)
+        for widget in widgets:
+            widget.blockSignals(True)
+        self._wp_enable.setChecked(bool(cfg["enabled"] and available))
+        self._strength.setValue(cfg["strength"])
+        self._panel.setValue(cfg["panel_alpha"])
+        for widget in widgets:
+            widget.blockSignals(False)
+        self._paint_readouts()
+
+    def _paint_readouts(self):
+        self._readouts[self._strength].setText(f"{self._strength.value()}%")
+        self._readouts[self._panel].setText(f"{self._panel.value()}%")
+
+    def _on_wp_slide(self):
+        self._paint_readouts()
+        preview_wallpaper(self._wp_source(), self._wp_enable.isChecked(),
+                          self._strength.value(), self._panel.value())
+        self._commit_timer.start()
+
+    def _on_wp_toggle(self, checked: bool):
+        for slider in (self._strength, self._panel):
+            slider.setEnabled(checked and bool(self._wp_source()))
+        self._commit_wallpaper()
+
+    def _commit_wallpaper(self):
+        self._commit_timer.stop()
+        self._paint_readouts()
+        save_wallpaper(self._wp_enable.isChecked(), self._strength.value(),
+                       self._panel.value())
+        preview_wallpaper(self._wp_source(), self._wp_enable.isChecked(),
+                          self._strength.value(), self._panel.value())
+        self.theme_applied.emit("custom")
 
     def custom(self) -> dict:
         return load_custom_theme()
@@ -309,6 +392,7 @@ class CustomThemeRow(QWidget):
         custom = self.custom()
         source = self._stored_source()
         has_palette = bool(custom.get("tokens"))
+        self._sync_wallpaper()
         self._pick.setText(tr("settings.theme_reextract") if source
                            else tr("settings.theme_pick"))
         self._swap.setVisible(has_palette)
