@@ -18,7 +18,7 @@ from PySide6.QtGui import QFont, QFontMetrics, QGuiApplication
 
 from lmloader.gui.api_client import LMLoaderAPI, run_in_thread
 from lmloader.gui.i18n import tr
-from lmloader.gui.styles import c
+from lmloader.gui.styles import c, tint
 from lmloader.gui.icons import copy_icon, eye_icon, gear_icon
 
 # How often the model page re-reads the loaded-model set. Short enough that a
@@ -739,7 +739,7 @@ class ModelsPage(QWidget):
             cfg_badge.setFixedWidth(cfg_slot_w)
             cfg_badge.setAlignment(Qt.AlignCenter)
             cfg_badge.setStyleSheet(
-                f"color: {c('accent')}; background: {c('accent')}22; border-radius: 8px;"
+                f"color: {c('accent')}; background: {tint('accent', 0x22 / 255)}; border-radius: 8px;"
                 "padding: 1px 4px; font-size: 11px; font-weight: 600;"
             )
             lay.addWidget(cfg_badge, 0, Qt.AlignVCenter)
@@ -918,7 +918,7 @@ class ModelsPage(QWidget):
     def _badge(self, text: str, color: str) -> QLabel:
         lbl = QLabel(text)
         lbl.setStyleSheet(
-            f"color: {color}; background: {color}22; border-radius: 10px;"
+            f"color: {color}; background: {tint(color, 0x22 / 255)}; border-radius: 10px;"
             "padding: 2px 10px; font-size: 12px; font-weight: 600;"
         )
         return lbl

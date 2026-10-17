@@ -24,7 +24,7 @@ from lmloader.gui.api_client import (
 from lmloader.gui.icons import copy_icon, download_icon
 from lmloader.gui.i18n import tr
 from lmloader.gui.repetition import detect_repetition_loop
-from lmloader.gui.styles import c
+from lmloader.gui.styles import c, tint
 from lmloader.gui.ui_config import load_ui_setting, save_ui_setting
 from lmloader.infra.chat_db import chat_db
 
@@ -646,7 +646,7 @@ class ChatPage(QWidget):
             f" QPushButton:checked {{ color: {c('accent')}; background: {c('accent_soft')};"
             f" border-color: {c('accent_border')}; }}"
             f' QPushButton[has="true"] {{ color: {c("green")};'
-            f" border-color: {c('green')}66; }}"
+            f" border-color: {tint('green', 0x66 / 255)}; }}"
         )
 
     def _prompt_templates(self) -> list[tuple[str, str]]:

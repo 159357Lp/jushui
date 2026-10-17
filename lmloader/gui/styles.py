@@ -31,19 +31,22 @@ _PALETTES = {
         "fg": "#c9d1d9",
         "title": "#f0f6fc",
         "accent": "#58a6ff",
-        "accent_soft": "#1f6feb22",      # translucent accent bg
+        # Tints are pre-composited onto `bg`, never "#RRGGBBAA": QColor reads an
+        # 8-digit colour as #AARRGGBB, so "#1f6feb22" silently paints a 12%-alpha
+        # *green* (#6FEB22). Anything translucent has to be mixed at authoring time.
+        "accent_soft": "#0F1E33",         # bg + 13% #1f6feb
         "accent_surface": "#17283b",
-        "accent_hover": "#1f6feb33",
-        "accent_border": "#1f6feb55",
+        "accent_hover": "#112441",        # bg + 20% #1f6feb
+        "accent_border": "#13305E",       # bg + 33% #1f6feb
         "green": "#3fb950",
-        "green_bg": "#3fb95022",
+        "green_bg": "#14271F",            # bg + 13% #3fb950
         "green_btn": "#238636",
         "green_btn_hover": "#2ea043",
         "red": "#f85149",
         "red_btn": "#da3633",
         "red_btn_hover": "#f85149",
-        "red_bg": "#da363322",
-        "red_border": "#da363344",
+        "red_bg": "#28161B",              # bg + 13% #da3633
+        "red_border": "#441B1E",          # bg + 27% #da3633
         "warn": "#d29922",
         # memory-breakdown segments (monitor page): weights/kv/state reuse
         # accent/green/warn, these two have no existing semantic token.
@@ -63,12 +66,12 @@ _PALETTES = {
         "control_border": "#30363d",  # form-control outline
         "scroll_handle": "#30363d",
         "scroll_handle_hover": "#484f58",
-        "bubble_user": "#1f6feb22",         # user message fill
-        "bubble_border": "#1f6feb44",
+        "bubble_user": "#0F1E33",         # bg + 13% #1f6feb
+        "bubble_border": "#122A50",       # bg + 27% #1f6feb
         "sidebar_active_fg": "#58a6ff",
         "sidebar_fg_hover": "#c9d1d9",
         "grid": "#21262d",                       # gridlines / groove fill
-        "on_accent": "white",             # text drawn on a filled accent
+        "on_accent": "#FFFFFF",             # text drawn on a filled accent
         "on_accent_disabled": "#484f58",
     },
     "light": {
@@ -129,6 +132,23 @@ current_theme = "dark"
 def c(name: str) -> str:
     """Theme-aware color lookup for inline QSS in pages."""
     return _PALETTES[current_theme].get(name, _PALETTES["dark"].get(name, "#000000"))
+
+
+def tint(colour: str, alpha: float, over: str = "bg") -> str:
+    """`colour` washed over palette colour `over`, returned as a solid #RRGGBB.
+
+    A "#RRGGBBAA" suffix is not usable in QSS: QColor reads the leading pair as
+    alpha, so "#58a6ff22" paints a lime badge instead of a blue one. Washes are
+    therefore mixed here, which also keeps them following a custom palette.
+    `colour` may be a token name or a literal hex.
+    """
+    def rgb(value: str) -> tuple[int, int, int]:
+        value = value if value.startswith("#") else c(value)
+        return tuple(int(value[i:i + 2], 16) for i in (1, 3, 5))  # type: ignore[return-value]
+
+    base, top = rgb(over), rgb(colour)
+    return "#{:02X}{:02X}{:02X}".format(
+        *(round(base[i] + (top[i] - base[i]) * alpha) for i in range(3)))
 
 
 _DARK_QSS = r"""
