@@ -356,8 +356,18 @@ class LMLoaderAPI:
         except Exception:
             return {"discovered": [], "scan_dirs": []}
 
+    def engine_kinds(self) -> list[dict]:
+        try:
+            resp = http_get(f"{self.base_url}/api/engine/kinds", headers=self._headers(), timeout=10.0)
+            resp.raise_for_status()
+            return resp.json().get("kinds", []) or []
+        except Exception:
+            return []
+
     def set_engine_scan_dirs(self, scan_dirs: list[str]) -> dict:
-        resp = http_post(f"{self.base_url}/api/engine/scan-dirs", json={"scan_dirs": scan_dirs}, headers=self._headers(), timeout=15.0)
+        # Guardian-gated: the backend waits up to 300s for the user to approve,
+        # so the client must not hang up while that dialog is still open.
+        resp = http_post(f"{self.base_url}/api/engine/scan-dirs", json={"scan_dirs": scan_dirs}, headers=self._headers(), timeout=330.0)
         resp.raise_for_status()
         return resp.json()
 
@@ -366,7 +376,37 @@ class LMLoaderAPI:
             f"{self.base_url}/api/engine/custom",
             json={"name": name, "kind": kind, "binary_path": binary_path},
             headers=self._headers(),
-            timeout=15.0,
+            # The backend parks this request inside the approval dialog (up to
+            # 300s). A 15s client timeout used to fire while the user was still
+            # reading it — the change then landed with no response to show.
+            timeout=330.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def list_custom_engines(self) -> list[dict]:
+        try:
+            resp = http_get(f"{self.base_url}/api/engine/custom",
+                            headers=self._headers(), timeout=10.0)
+            resp.raise_for_status()
+            return resp.json().get("custom_engines", []) or []
+        except Exception:
+            return []
+
+    def update_custom_engine(self, name: str, binary_path: str) -> dict:
+        resp = http_post(
+            f"{self.base_url}/api/engine/custom/update",
+            json={"name": name, "binary_path": binary_path},
+            headers=self._headers(), timeout=330.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def rollback_custom_engine(self, name: str) -> dict:
+        resp = http_post(
+            f"{self.base_url}/api/engine/custom/rollback",
+            params={"name": name},
+            headers=self._headers(), timeout=330.0,
         )
         resp.raise_for_status()
         return resp.json()

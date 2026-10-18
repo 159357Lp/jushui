@@ -3,7 +3,7 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QSpinBox, QCheckBox, QPushButton, QLabel,
-    QGroupBox, QFileDialog, QMessageBox, QComboBox, QScrollArea, QFrame,
+    QGroupBox, QFileDialog, QMessageBox, QComboBox, QScrollArea,
     QTableWidget, QTableWidgetItem, QHeaderView,
 )
 from PySide6.QtCore import Qt, Signal
@@ -26,6 +26,13 @@ def _get_config_path() -> Path:  # FIXED: G4
     return Path("config.yaml")
 
 
+# The two built-in slots always own the first rows of the version table, so their
+# widgets survive every rescan and the update/rollback code can keep addressing
+# them by attribute name.
+_SLOT_ROWS = (("primary", "settings.engine_row_primary"),
+              ("ternary", "settings.engine_row_ternary"))
+
+
 class SettingsPage(QWidget):
     theme_changed = Signal(str)
 
@@ -33,6 +40,9 @@ class SettingsPage(QWidget):
         super().__init__()
         self.api = api
         self._config_path = _get_config_path()  # FIXED: G4
+        self._threads: list = []
+        self._custom_actions: dict[str, tuple] = {}
+        self._custom_targets: dict[str, dict] = {}
         self._init_ui()
         self._load_settings()
 
@@ -48,35 +58,39 @@ class SettingsPage(QWidget):
         scroll_content = QWidget()
         scroll_layout = QVBoxLayout(scroll_content)
         scroll_layout.setContentsMargins(0, 0, 0, 0)
-        scroll_layout.setSpacing(16)
+        scroll_layout.setSpacing(14)
 
-        # Two-column layout: engine management on the left, server / paths /
-        # network settings on the right. Cuts the page's scroll height roughly
-        # in half; the discovered-engine table stays full width below.
-        left_col = QVBoxLayout()
-        left_col.setSpacing(16)
-        right_col = QVBoxLayout()
-        right_col.setSpacing(16)
+        # ① Engines: three equal-width cards, config only. Version/update
+        # controls used to be embedded in the two left cards, which made the
+        # page a stack of forms of different heights.
+        engines = QHBoxLayout()
+        engines.setSpacing(12)
+        # AlignTop: without it every card is stretched to the tallest one and the
+        # two short cards become empty boxes.
+        engines.addWidget(self._build_engine_group(tr("settings.primary_engine"), "primary"), 1, Qt.AlignTop)
+        engines.addWidget(self._build_engine_group(tr("settings.ternary_engine"), "ternary"), 1, Qt.AlignTop)
+        engines.addWidget(self._build_pluggable_group(), 1, Qt.AlignTop)
+        scroll_layout.addLayout(engines)
 
-        left_col.addWidget(
-            self._build_engine_group(tr("settings.primary_engine"), "primary", with_update=True)
-        )
-        left_col.addWidget(
-            self._build_engine_group(tr("settings.ternary_engine"), "ternary", with_update=True)
-        )
+        # ② Versions: one row per engine, slots first, then custom registrations
+        # and anything else discovery found.
+        scroll_layout.addWidget(self._build_version_group())
 
-        right_col.addWidget(self._build_appearance_group())
-        right_col.addWidget(self._build_server_group())
-        right_col.addWidget(self._build_paths_group())
-        right_col.addWidget(self._build_download_group())
+        # ③④ Server + appearance side by side.
+        row2 = QHBoxLayout()
+        row2.setSpacing(12)
+        row2.addWidget(self._build_server_group(), 1, Qt.AlignTop)
+        row2.addWidget(self._build_appearance_group(), 1, Qt.AlignTop)
+        scroll_layout.addLayout(row2)
 
-        columns = QHBoxLayout()
-        columns.setSpacing(16)
-        columns.addLayout(left_col, 1)
-        columns.addLayout(right_col, 1)
-        scroll_layout.addLayout(columns)
+        # ⑤⑥ Paths + downloads side by side.
+        row3 = QHBoxLayout()
+        row3.setSpacing(12)
+        row3.addWidget(self._build_paths_group(), 1, Qt.AlignTop)
+        row3.addWidget(self._build_download_group(), 1, Qt.AlignTop)
+        scroll_layout.addLayout(row3)
 
-        scroll_layout.addWidget(self._build_extra_engines_group())
+        scroll_layout.addStretch()
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -96,10 +110,11 @@ class SettingsPage(QWidget):
         btn_bar.addWidget(reset_btn)
         layout.addLayout(btn_bar)
 
-    def _build_engine_group(self, title: str, slot: str, with_update: bool = False) -> QGroupBox:
+    def _build_engine_group(self, title: str, slot: str) -> QGroupBox:
         group = QGroupBox(title)
         form = QFormLayout(group)
         form.setSpacing(8)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
         path_edit = QLineEdit()
         path_edit.setPlaceholderText(tr("settings.binary_placeholder"))
@@ -113,7 +128,6 @@ class SettingsPage(QWidget):
             "settings.ternary_path" if slot == "ternary" else "settings.binary_path"
         )
         form.addRow(tr(path_label_key), path_row)
-
         setattr(self, f"{slot}_path", path_edit)
 
         flash_check = QCheckBox(tr("settings.enable_flash"))
@@ -121,69 +135,11 @@ class SettingsPage(QWidget):
         form.addRow("", flash_check)
         setattr(self, f"{slot}_flash", flash_check)
 
-        if with_update:
-            if not getattr(self, "_threads", None):
-                self._threads: list = []
-            sep = QFrame()
-            sep.setFrameShape(QFrame.HLine)
-            form.addRow(sep)
-
-            title_key = (
-                "settings.update_title_official" if slot == "primary"
-                else "settings.update_title_prism"
-            )
-            sub = QLabel(tr(title_key))
-            f = sub.font()
-            f.setBold(True)
-            sub.setFont(f)
-            form.addRow(sub)
-
-            ver_lbl = QLabel("...")
-            ver_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            form.addRow(tr("settings.engine_current"), ver_lbl)
-            setattr(self, f"{slot}_ver_lbl", ver_lbl)
-
-            latest_lbl = QLabel("-")
-            latest_lbl.setWordWrap(True)
-            form.addRow(tr("settings.engine_latest"), latest_lbl)
-            setattr(self, f"{slot}_latest_lbl", latest_lbl)
-
-            btn_row = QHBoxLayout()
-            check_btn = QPushButton(tr("settings.check_update"))
-            check_btn.clicked.connect(lambda _=False, s=slot: self._check_engine_update(s))
-            btn_row.addWidget(check_btn)
-            setattr(self, f"{slot}_check_btn", check_btn)
-
-            upd_btn = QPushButton(tr("settings.update_engine"))
-            upd_btn.setObjectName("primary")
-            upd_btn.setEnabled(False)
-            upd_btn.clicked.connect(lambda _=False, s=slot: self._update_engine(s))
-            btn_row.addWidget(upd_btn)
-            setattr(self, f"{slot}_update_btn", upd_btn)
-
-            rollback_btn = QPushButton(tr("settings.rollback_engine"))
-            rollback_btn.setEnabled(False)
-            rollback_btn.setToolTip(tr("settings.rollback_tip"))
-            rollback_btn.clicked.connect(lambda _=False, s=slot: self._rollback_engine(s))
-            btn_row.addWidget(rollback_btn)
-            setattr(self, f"{slot}_rollback_btn", rollback_btn)
-            btn_row.addStretch()
-            form.addRow("", btn_row)
-
-            tip_key = (
-                "settings.update_tip_official" if slot == "primary"
-                else "settings.update_tip_prism"
-            )
-            tip = QLabel(tr(tip_key))
-            tip.setObjectName("subtitle")
-            tip.setWordWrap(True)
-            form.addRow("", tip)
-
-            cuda_lbl = QLabel("...")
-            cuda_lbl.setObjectName("subtitle")
-            cuda_lbl.setWordWrap(True)
-            form.addRow(cuda_lbl)
-            setattr(self, f"{slot}_cuda_lbl", cuda_lbl)
+        cuda_lbl = QLabel("...")
+        cuda_lbl.setObjectName("subtitle")
+        cuda_lbl.setWordWrap(True)
+        form.addRow(cuda_lbl)
+        setattr(self, f"{slot}_cuda_lbl", cuda_lbl)
 
         # Per-slot startup timeout. Lives on the slot (not on defaults) because
         # that is where LifecycleManager._wait_for_health reads it.
@@ -196,6 +152,187 @@ class SettingsPage(QWidget):
         setattr(self, f"{slot}_timeout", timeout_spin)
 
         return group
+
+    def _build_pluggable_group(self) -> QGroupBox:
+        """Third engine card: search dirs + custom engine registration."""
+        group = QGroupBox(tr("settings.pluggable_engine"))
+        form = QFormLayout(group)
+        form.setSpacing(8)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
+        tip = QLabel(tr("settings.pluggable_tip"))
+        tip.setObjectName("subtitle")
+        tip.setWordWrap(True)
+        form.addRow(tip)
+
+        self.scan_dirs_edit = QLineEdit()
+        self.scan_dirs_edit.setPlaceholderText("D:/engines;D:/rwkv")
+        self.save_dirs_btn = QPushButton(tr("settings.save_dirs"))
+        self.save_dirs_btn.clicked.connect(self._save_scan_dirs)
+        dirs_row = QHBoxLayout()
+        dirs_row.addWidget(self.scan_dirs_edit, 1)
+        dirs_row.addWidget(self.save_dirs_btn)
+        form.addRow(tr("settings.engine_scan_dirs"), dirs_row)
+
+        self.rescan_btn = QPushButton(tr("settings.rescan"))
+        self.rescan_btn.clicked.connect(self._refresh_engines)
+        rescan_row = QHBoxLayout()
+        rescan_row.addWidget(self.rescan_btn)
+        rescan_row.addStretch()
+        form.addRow("", rescan_row)
+
+        self.custom_name_edit = QLineEdit()
+        self.custom_name_edit.setPlaceholderText(tr("settings.engine_name_ph"))
+        form.addRow(tr("settings.engine_name"), self.custom_name_edit)
+
+        self.custom_kind_combo = QComboBox()
+        form.addRow(tr("settings.engine_type"), self.custom_kind_combo)
+
+        self.custom_path_edit = QLineEdit()
+        self.custom_path_edit.setPlaceholderText("D:/engines/rwkv-server.exe")
+        browse_btn = QPushButton(tr("settings.browse"))
+        browse_btn.clicked.connect(self._browse_custom_engine)
+        path_row = QHBoxLayout()
+        path_row.addWidget(self.custom_path_edit, 1)
+        path_row.addWidget(browse_btn)
+        form.addRow(tr("settings.engine_path"), path_row)
+
+        self.add_engine_btn = QPushButton(tr("settings.add_engine"))
+        self.add_engine_btn.setObjectName("primary")
+        self.add_engine_btn.clicked.connect(self._add_custom_engine)
+        add_row = QHBoxLayout()
+        add_row.addWidget(self.add_engine_btn)
+        add_row.addStretch()
+        form.addRow("", add_row)
+
+        return group
+
+    def _build_version_group(self) -> QGroupBox:
+        """One row per engine: version, what it can run, and its update controls."""
+        group = QGroupBox(tr("settings.section_versions"))
+        vbox = QVBoxLayout(group)
+        vbox.setSpacing(8)
+
+        tip = QLabel(tr("settings.versions_tip"))
+        tip.setObjectName("subtitle")
+        tip.setWordWrap(True)
+        vbox.addWidget(tip)
+
+        table = QTableWidget(len(_SLOT_ROWS), 6)
+        table.setHorizontalHeaderLabels([
+            tr("settings.col_engine"), tr("settings.col_kind"), tr("settings.col_path"),
+            tr("settings.engine_formats"), tr("settings.col_version"), tr("settings.col_action"),
+        ])
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.Interactive)
+        header.setSectionResizeMode(5, QHeaderView.Interactive)
+        table.verticalHeader().setVisible(False)
+        # Cell widgets (multi-line version labels, button rows) do not drive row
+        # height, so the default has to leave room for them.
+        table.verticalHeader().setDefaultSectionSize(72)
+        table.setColumnWidth(4, 300)
+        table.setColumnWidth(5, 330)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setMaximumHeight(460)
+        self.version_table = table
+        vbox.addWidget(table)
+
+        for row, (slot, name_key) in enumerate(_SLOT_ROWS):
+            self._set_cell(row, 0, tr(name_key))
+            self._set_cell(row, 1, "llama")
+
+            ver_lbl = QLabel("...")
+            ver_lbl.setWordWrap(True)
+            ver_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            latest_lbl = QLabel("-")
+            latest_lbl.setObjectName("subtitle")
+            latest_lbl.setWordWrap(True)
+            setattr(self, f"{slot}_ver_lbl", ver_lbl)
+            setattr(self, f"{slot}_latest_lbl", latest_lbl)
+            cell = QWidget()
+            cell_box = QVBoxLayout(cell)
+            cell_box.setContentsMargins(4, 2, 4, 2)
+            cell_box.setSpacing(2)
+            cell_box.addWidget(ver_lbl)
+            cell_box.addWidget(latest_lbl)
+            table.setCellWidget(row, 4, cell)
+
+            btn_row = QHBoxLayout()
+            btn_row.setContentsMargins(2, 2, 2, 2)
+            btn_row.setSpacing(6)
+            check_btn = QPushButton(tr("settings.check_update"))
+            check_btn.clicked.connect(lambda _=False, s=slot: self._check_engine_update(s))
+            setattr(self, f"{slot}_check_btn", check_btn)
+            btn_row.addWidget(check_btn)
+
+            upd_btn = QPushButton(tr("settings.update_engine"))
+            upd_btn.setObjectName("primary")
+            upd_btn.setEnabled(False)
+            upd_btn.clicked.connect(lambda _=False, s=slot: self._update_engine(s))
+            setattr(self, f"{slot}_update_btn", upd_btn)
+            btn_row.addWidget(upd_btn)
+
+            rollback_btn = QPushButton(tr("settings.rollback_engine"))
+            rollback_btn.setEnabled(False)
+            rollback_btn.setToolTip(tr("settings.rollback_tip"))
+            rollback_btn.clicked.connect(lambda _=False, s=slot: self._rollback_engine(s))
+            setattr(self, f"{slot}_rollback_btn", rollback_btn)
+            btn_row.addWidget(rollback_btn)
+            cell = QWidget()
+            cell.setLayout(btn_row)
+            table.setCellWidget(row, 5, cell)
+
+        return group
+
+    def _set_cell(self, row: int, col: int, text: str):
+        item = QTableWidgetItem(text)
+        item.setToolTip(text)
+        self.version_table.setItem(row, col, item)
+
+    def _reflow_rows(self):
+        """Grow rows to whatever the version cell actually wraps into.
+
+        Two Qt quirks stack up here: a row never expands because a cell widget
+        got taller, and QTableView hands an index widget a rect a few pixels
+        shorter than the row — that gap is measured off Qt instead of guessed.
+        """
+        table = self.version_table
+        chrome = 0
+        for row in range(table.rowCount()):
+            for col in (4, 5):
+                cell = table.cellWidget(row, col)
+                if cell is not None and cell.height() > 0:
+                    chrome = max(chrome, table.rowHeight(row) - cell.height())
+        for row in range(table.rowCount()):
+            height = table.verticalHeader().defaultSectionSize()
+            for col in (4, 5):
+                cell = table.cellWidget(row, col)
+                box = cell.layout() if cell is not None else None
+                if box is None:
+                    continue
+                margins = box.contentsMargins()
+                inner_w = max(60, table.columnWidth(col) - margins.left() - margins.right() - 8)
+                labels = cell.findChildren(QLabel)
+                if labels:
+                    needed = margins.top() + margins.bottom()
+                    needed += box.spacing() * (len(labels) - 1)
+                    for lbl in labels:
+                        lbl.setFixedWidth(inner_w)
+                        # QLabel caches its hint, so heightForWidth is asked before
+                        # the new text has been laid out. QFontMetrics at the width
+                        # the label will really get is the only number that agrees
+                        # with what ends up on screen; +8 covers the document margin.
+                        needed += lbl.fontMetrics().boundingRect(
+                            0, 0, inner_w, 10000, Qt.TextWordWrap,
+                            lbl.text()).height() + 8
+                else:
+                    needed = box.totalSizeHint().height()
+                height = max(height, needed + chrome)
+            table.setRowHeight(row, height)
 
     def _check_engine_update(self, slot: str):
         from lmloader.gui.api_client import run_in_thread
@@ -225,11 +362,13 @@ class SettingsPage(QWidget):
             else:
                 latest_lbl.setText(tr("settings.no_update"))
                 upd_btn.setEnabled(False)
+            self._reflow_rows()
 
         def on_error(err):
             check_btn.setEnabled(True)
             check_btn.setText(tr("settings.check_update"))
             latest_lbl.setText(tr("settings.update_error").format(err=err))
+            self._reflow_rows()
 
         t = run_in_thread(fetch, on_result, on_error)
         self._threads.append(t)
@@ -259,12 +398,14 @@ class SettingsPage(QWidget):
             getattr(self, f"{slot}_latest_lbl").setText(
                 tr("settings.updated_ok").format(tag=data.get("result", {}).get("tag", ""))
             )
+            self._reflow_rows()
             # path field may have changed (slot moved into its own directory)
             installed = data.get("result", {}).get("installed")
             if installed:
                 path_edit = getattr(self, f"{slot}_path", None)
                 if path_edit is not None:
                     path_edit.setText(installed)
+                self._set_cell(self._slot_row(slot), 2, installed)
             QMessageBox.information(self, tr("settings.updated_title"), tr("settings.updated_msg"))
 
         def on_error(err):
@@ -326,6 +467,7 @@ class SettingsPage(QWidget):
         self._load_engine_status("primary")
         self._load_engine_status("ternary")
         self._load_download_config()
+        self._refresh_engines()
 
     def _load_engine_status(self, slot: str):
         from lmloader.gui.api_client import run_in_thread
@@ -367,6 +509,7 @@ class SettingsPage(QWidget):
                     cuda_lbl.setText(tr("settings.cuda_ok"))
                 else:
                     cuda_lbl.setText(tr("settings.cuda_missing"))
+            self._reflow_rows()
 
         def on_error(_err):
             lbl = getattr(self, f"{slot}_ver_lbl", None)
@@ -376,90 +519,214 @@ class SettingsPage(QWidget):
         t = run_in_thread(fetch, on_result, on_error)
         self._threads.append(t)
 
-        # engine kinds for the custom-engine combo
-        try:
-            import httpx as _httpx
-            kinds = _httpx.get(f"{self.api.base_url}/api/engine/kinds", timeout=10.0).json().get("kinds", [])
-            self.custom_kind_combo.clear()
-            for k in kinds:
-                self.custom_kind_combo.addItem(k["label"], k["kind"])
-        except Exception:
-            pass
+    def _refresh_engines(self):
+        """Re-read discovery + registrations and rebuild the non-slot rows."""
+        from lmloader.gui.api_client import run_in_thread
 
-        self._rescan_engines()
+        self.rescan_btn.setEnabled(False)
+        self.rescan_btn.setText(tr("settings.scanning"))
 
-    def _build_extra_engines_group(self) -> QGroupBox:
-        """Other-format engines: search dirs + rescan + custom engines."""
-        group = QGroupBox(tr("settings.extra_engines"))
-        vbox = QVBoxLayout(group)
-        vbox.setSpacing(8)
+        def fetch():
+            return self.api.engine_discover(), self.api.list_custom_engines(), self.api.engine_kinds()
 
-        tip = QLabel(tr("settings.extra_engines_tip"))
-        tip.setObjectName("subtitle")
-        tip.setWordWrap(True)
-        vbox.addWidget(tip)
+        def on_result(data):
+            discovered, customs, kinds = data
+            self.rescan_btn.setEnabled(True)
+            self.rescan_btn.setText(tr("settings.rescan"))
+            self.scan_dirs_edit.setText(";".join(discovered.get("scan_dirs", [])))
+            if kinds and self.custom_kind_combo.count() == 0:
+                for k in kinds:
+                    self.custom_kind_combo.addItem(k["label"], k["kind"])
+            self._fill_engine_rows(discovered.get("discovered", []), customs)
 
-        dir_row = QHBoxLayout()
-        self.scan_dirs_edit = QLineEdit()
-        self.scan_dirs_edit.setPlaceholderText("D:/engines;D:/rwkv")
-        dir_row.addWidget(QLabel(tr("settings.engine_scan_dirs")))
-        dir_row.addWidget(self.scan_dirs_edit, 1)
-        vbox.addLayout(dir_row)
+        def on_error(err):
+            self.rescan_btn.setEnabled(True)
+            self.rescan_btn.setText(tr("settings.rescan"))
+            QMessageBox.critical(self, tr("settings.error_title"), str(err))
+
+        t = run_in_thread(fetch, on_result, on_error)
+        self._threads.append(t)
+
+    def _fill_engine_rows(self, discovered: list[dict], customs: list[dict]):
+        while self.version_table.rowCount() > len(_SLOT_ROWS):
+            self.version_table.removeRow(len(_SLOT_ROWS))
+        self._custom_actions.clear()
+        self._custom_targets.clear()
+
+        formats_by_name: dict[str, str] = {}
+        slot_row = {slot: i for i, (slot, _) in enumerate(_SLOT_ROWS)}
+        for eng in discovered:
+            name = eng.get("name", "")
+            formats_by_name[name] = ", ".join(eng.get("formats", []))
+            if eng.get("source") == "config" and name in slot_row:
+                self._set_cell(slot_row[name], 2, eng.get("binary_path", ""))
+                self._set_cell(slot_row[name], 3, ", ".join(eng.get("formats", [])))
+
+        for entry in customs:
+            self._append_custom_row(entry, formats_by_name.get(entry.get("name", ""), ""))
+
+        for eng in discovered:
+            if eng.get("source") != "scan":
+                continue
+            row = self.version_table.rowCount()
+            self.version_table.insertRow(row)
+            self._set_cell(row, 0, eng.get("name", ""))
+            self._set_cell(row, 1, eng.get("kind", ""))
+            self._set_cell(row, 2, eng.get("binary_path", ""))
+            self._set_cell(row, 3, ", ".join(eng.get("formats", [])))
+            self._set_cell(row, 4, tr("settings.auto_discovered"))
+            self._set_cell(row, 5, tr("settings.action_none"))
+
+        if not customs and not any(e.get("source") == "scan" for e in discovered):
+            row = self.version_table.rowCount()
+            self.version_table.insertRow(row)
+            self._set_cell(row, 0, tr("settings.no_discovered"))
+        self._reflow_rows()
+
+    def _append_custom_row(self, entry: dict, formats: str):
+        table = self.version_table
+        name = entry.get("name", "")
+        history = entry.get("history") or []
+        row = table.rowCount()
+        table.insertRow(row)
+        self._set_cell(row, 0, name)
+        self._set_cell(row, 1, entry.get("kind", ""))
+        self._set_cell(row, 2, entry.get("binary_path", ""))
+        self._set_cell(row, 3, formats)
+
+        ver_lbl = QLabel(tr("settings.manual_registered"))
+        ver_lbl.setObjectName("subtitle")
+        hist_lbl = QLabel(
+            tr("settings.custom_history").format(n=len(history)) if history
+            else tr("settings.custom_no_history")
+        )
+        hist_lbl.setObjectName("subtitle")
+        hist_lbl.setWordWrap(True)
+        cell = QWidget()
+        cell_box = QVBoxLayout(cell)
+        cell_box.setContentsMargins(4, 2, 4, 2)
+        cell_box.setSpacing(2)
+        cell_box.addWidget(ver_lbl)
+        cell_box.addWidget(hist_lbl)
+        table.setCellWidget(row, 4, cell)
+
+        swap_btn = QPushButton(tr("settings.swap_binary"))
+        swap_btn.clicked.connect(lambda _=False, n=name: self._swap_custom_binary(n))
+        rb_btn = QPushButton(tr("settings.rollback_engine"))
+        rb_btn.setEnabled(bool(history))
+        rb_btn.clicked.connect(lambda _=False, n=name: self._rollback_custom(n))
+        if history:
+            self._custom_targets[name] = history[0]
+            rb_btn.setToolTip(
+                tr("settings.rollback_tip").format(ver=history[0].get("version", "?"))
+                + f"\n{history[0].get('binary_path', '')}"
+            )
+        else:
+            rb_btn.setToolTip(tr("settings.custom_no_history"))
+        self._custom_actions[name] = (swap_btn, rb_btn)
 
         btn_row = QHBoxLayout()
-        self.save_dirs_btn = QPushButton(tr("settings.save_dirs"))
-        self.save_dirs_btn.clicked.connect(self._save_scan_dirs)
-        btn_row.addWidget(self.save_dirs_btn)
-        self.rescan_btn = QPushButton(tr("settings.rescan"))
-        self.rescan_btn.clicked.connect(self._rescan_engines)
-        btn_row.addWidget(self.rescan_btn)
-        btn_row.addStretch()
-        vbox.addLayout(btn_row)
+        btn_row.setContentsMargins(2, 2, 2, 2)
+        btn_row.setSpacing(6)
+        btn_row.addWidget(swap_btn)
+        btn_row.addWidget(rb_btn)
+        cell = QWidget()
+        cell.setLayout(btn_row)
+        table.setCellWidget(row, 5, cell)
 
-        self.discovered_table = QTableWidget(0, 4)
-        self.discovered_table.setHorizontalHeaderLabels(
-            [tr("settings.engine_name"), tr("settings.engine_type"),
-             tr("settings.engine_path"), tr("settings.engine_formats")]
+    def _slot_row(self, slot: str) -> int:
+        for i, (name, _) in enumerate(_SLOT_ROWS):
+            if name == slot:
+                return i
+        raise KeyError(slot)
+
+    def _swap_custom_binary(self, name: str):
+        from lmloader.gui.api_client import run_in_thread
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, tr("settings.swap_binary_title"), "",
+            "Engine binaries (*.exe);;All files (*)",
         )
-        self.discovered_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.discovered_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.discovered_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.discovered_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.discovered_table.verticalHeader().setVisible(False)
-        self.discovered_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.discovered_table.setMaximumHeight(160)
-        vbox.addWidget(self.discovered_table)
+        if not path:
+            return
+        reply = QMessageBox.question(
+            self, tr("settings.swap_confirm_title"),
+            tr("settings.custom_swap_confirm_msg").format(name=name, to=path),
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
 
-        custom_row = QHBoxLayout()
-        self.custom_name_edit = QLineEdit()
-        self.custom_name_edit.setPlaceholderText(tr("settings.engine_name_ph"))
-        custom_row.addWidget(QLabel(tr("settings.engine_name")))
-        custom_row.addWidget(self.custom_name_edit, 1)
-        vbox.addLayout(custom_row)
+        swap_btn, rb_btn = self._custom_actions[name]
+        swap_btn.setEnabled(False)
+        rb_btn.setEnabled(False)
+        swap_btn.setText(tr("settings.working"))
 
-        custom_row2 = QHBoxLayout()
-        self.custom_kind_combo = QComboBox()
-        custom_row2.addWidget(QLabel(tr("settings.engine_type")))
-        custom_row2.addWidget(self.custom_kind_combo, 1)
-        self.custom_path_edit = QLineEdit()
-        self.custom_path_edit.setPlaceholderText("D:/engines/rwkv-server.exe")
-        custom_row2.addWidget(QLabel(tr("settings.engine_path")))
-        custom_row2.addWidget(self.custom_path_edit, 3)
-        browse_btn = QPushButton(tr("settings.browse"))
-        browse_btn.clicked.connect(self._browse_custom_engine)
-        custom_row2.addWidget(browse_btn)
-        vbox.addLayout(custom_row2)
+        def fetch():
+            return self.api.update_custom_engine(name, path)
 
-        add_row = QHBoxLayout()
-        self.add_engine_btn = QPushButton(tr("settings.add_engine"))
-        self.add_engine_btn.setObjectName("primary")
-        self.add_engine_btn.clicked.connect(self._add_custom_engine)
-        add_row.addWidget(self.add_engine_btn)
-        add_row.addStretch()
-        vbox.addLayout(add_row)
+        def on_result(data):
+            swap_btn.setText(tr("settings.swap_binary"))
+            if data.get("status") == "already_current":
+                QMessageBox.information(
+                    self, tr("settings.added_title"),
+                    tr("settings.custom_already_current").format(name=name),
+                )
+            else:
+                QMessageBox.information(
+                    self, tr("settings.custom_swapped_title"),
+                    tr("settings.custom_swapped_msg").format(name=name),
+                )
+            self._refresh_engines()
 
-        self._threads: list = []
-        return group
+        def on_error(err):
+            swap_btn.setText(tr("settings.swap_binary"))
+            swap_btn.setEnabled(True)
+            rb_btn.setEnabled(True)
+            QMessageBox.critical(self, tr("settings.error_title"), str(err))
+
+        t = run_in_thread(fetch, on_result, on_error)
+        self._threads.append(t)
+
+    def _rollback_custom(self, name: str):
+        from lmloader.gui.api_client import run_in_thread
+
+        target = self._custom_targets.get(name) or {}
+        to = target.get("binary_path", "?")
+        reply = QMessageBox.question(
+            self, tr("settings.rollback_confirm_title"),
+            tr("settings.rollback_custom_confirm_msg").format(name=name, to=to),
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        swap_btn, rb_btn = self._custom_actions[name]
+        swap_btn.setEnabled(False)
+        rb_btn.setEnabled(False)
+        rb_btn.setText(tr("settings.rolling_back"))
+
+        def fetch():
+            return self.api.rollback_custom_engine(name)
+
+        def on_result(data):
+            rb_btn.setText(tr("settings.rollback_engine"))
+            QMessageBox.information(
+                self, tr("settings.rolled_back_title"),
+                tr("settings.custom_rolled_back_msg").format(
+                    name=name, to=data.get("binary_path", "?"),
+                ),
+            )
+            self._refresh_engines()
+
+        def on_error(err):
+            rb_btn.setText(tr("settings.rollback_engine"))
+            swap_btn.setEnabled(True)
+            rb_btn.setEnabled(True)
+            QMessageBox.critical(self, tr("settings.error_title"), str(err))
+
+        t = run_in_thread(fetch, on_result, on_error)
+        self._threads.append(t)
 
     def _browse_custom_engine(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -480,7 +747,7 @@ class SettingsPage(QWidget):
 
         def on_result(_data):
             self.save_dirs_btn.setEnabled(True)
-            self._rescan_engines()
+            self._refresh_engines()
 
         def on_error(err):
             self.save_dirs_btn.setEnabled(True)
@@ -488,45 +755,6 @@ class SettingsPage(QWidget):
 
         t = run_in_thread(fetch, on_result, on_error)
         self._threads.append(t)
-
-    def _rescan_engines(self):
-        from lmloader.gui.api_client import run_in_thread
-
-        self.rescan_btn.setEnabled(False)
-        self.rescan_btn.setText(tr("settings.scanning"))
-
-        def fetch():
-            return self.api.engine_discover()
-
-        def on_result(data):
-            self.rescan_btn.setEnabled(True)
-            self.rescan_btn.setText(tr("settings.rescan"))
-            scan_dirs = data.get("scan_dirs", [])
-            self.scan_dirs_edit.setText(";".join(scan_dirs))
-            self._fill_discovered(data.get("discovered", []))
-
-        def on_error(err):
-            self.rescan_btn.setEnabled(True)
-            self.rescan_btn.setText(tr("settings.rescan"))
-
-        t = run_in_thread(fetch, on_result, on_error)
-        self._threads.append(t)
-
-    def _fill_discovered(self, discovered: list[dict]):
-        self.discovered_table.setRowCount(0)
-        if not discovered:
-            self.discovered_table.setRowCount(1)
-            item = QTableWidgetItem(tr("settings.no_discovered"))
-            item.setTextAlignment(Qt.AlignCenter)
-            self.discovered_table.setItem(0, 0, item)
-            return
-        for eng in discovered:
-            row = self.discovered_table.rowCount()
-            self.discovered_table.insertRow(row)
-            self.discovered_table.setItem(row, 0, QTableWidgetItem(eng.get("name", "")))
-            self.discovered_table.setItem(row, 1, QTableWidgetItem(eng.get("kind", "")))
-            self.discovered_table.setItem(row, 2, QTableWidgetItem(eng.get("binary_path", "")))
-            self.discovered_table.setItem(row, 3, QTableWidgetItem(", ".join(eng.get("formats", []))))
 
     def _add_custom_engine(self):
         from lmloader.gui.api_client import run_in_thread
@@ -547,7 +775,7 @@ class SettingsPage(QWidget):
             self.custom_name_edit.clear()
             self.custom_path_edit.clear()
             QMessageBox.information(self, tr("settings.added_title"), tr("settings.added_msg"))
-            self._rescan_engines()
+            self._refresh_engines()
 
         def on_error(err):
             self.add_engine_btn.setEnabled(True)
@@ -658,28 +886,13 @@ class SettingsPage(QWidget):
         self.dl_ollama_detected.setWordWrap(True)
         form.addRow("", self.dl_ollama_detected)
 
-        save_btn = QPushButton(tr("settings.download_save"))
-        save_btn.setObjectName("primary")
-        save_btn.clicked.connect(self._save_download_config)
-        form.addRow("", save_btn)
-        self.dl_status = QLabel("")
+        # Download settings are saved by the page-level 保存设置 button now; this
+        # label is where that save reports the outcome of the second write.
+        self.dl_status = QLabel(tr("settings.download_saved_hint"))
         self.dl_status.setObjectName("subtitle")
+        self.dl_status.setWordWrap(True)
         form.addRow("", self.dl_status)
         return group
-
-    def _save_download_config(self):
-        try:
-            self.api.set_download_config({
-                "proxy": self.dl_proxy.text().strip(),
-                "ollama_dir": self.dl_ollama_dir.text().strip(),
-            })
-            self.dl_status.setText(tr("settings.download_saved"))
-            self.dl_status.setStyleSheet(f"color: {c('green')};")
-            # Re-read so the detected-path hint reflects what was just saved.
-            self._load_download_config()
-        except Exception as e:  # noqa: BLE001
-            self.dl_status.setText(tr("settings.download_save_failed").format(err=str(e)))
-            self.dl_status.setStyleSheet(f"color: {c('red')};")
 
     def _load_download_config(self):
         try:
@@ -730,6 +943,7 @@ class SettingsPage(QWidget):
             path_edit = getattr(self, f"{slot}_path", None)
             if path_edit:
                 path_edit.setText(slot_config.get("binary_path", ""))
+                self._set_cell(self._slot_row(slot), 2, slot_config.get("binary_path", ""))
 
             gpu = getattr(self, f"{slot}_gpu_layers", None)
             if gpu:
@@ -797,6 +1011,7 @@ class SettingsPage(QWidget):
             path_edit = getattr(self, f"{slot}_path", None)
             if path_edit and path_edit.text():
                 slot_cfg["binary_path"] = path_edit.text()
+                self._set_cell(self._slot_row(slot), 2, path_edit.text())
 
             gpu = getattr(self, f"{slot}_gpu_layers", None)
             if gpu:
@@ -848,6 +1063,22 @@ class SettingsPage(QWidget):
             # "custom" theme by reading ui.custom_theme back off disk, and a save
             # that failed midway would repaint from the palette it just rejected.
             self.theme_changed.emit(config["ui"]["theme"])
-            QMessageBox.information(self, tr("settings.saved_title"), tr("settings.saved_msg"))
         except Exception as e:
             QMessageBox.critical(self, tr("settings.error_title"), tr("settings.save_error").format(err=e))
+            return
+
+        # The download config lives behind its own endpoint, so it is a second
+        # write — reported in its own group rather than merged into this dialog.
+        try:
+            self.api.set_download_config({
+                "proxy": self.dl_proxy.text().strip(),
+                "ollama_dir": self.dl_ollama_dir.text().strip(),
+            })
+            self.dl_status.setText(tr("settings.download_saved"))
+            self.dl_status.setStyleSheet(f"color: {c('green')};")
+            self._load_download_config()
+        except Exception as e:  # noqa: BLE001
+            self.dl_status.setText(tr("settings.download_save_failed").format(err=str(e)))
+            self.dl_status.setStyleSheet(f"color: {c('red')};")
+
+        QMessageBox.information(self, tr("settings.saved_title"), tr("settings.saved_msg"))

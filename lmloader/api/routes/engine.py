@@ -21,6 +21,7 @@ from lmloader.logger import logger
 
 import shutil
 import re
+import datetime
 
 router = APIRouter()
 
@@ -190,12 +191,30 @@ async def engine_add_custom(body: CustomEngineBody):
         with open("config.yaml", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
         customs = cfg.get("custom_engines", []) or []
+        # Re-registering a name is how the picker replaces an entry. Carrying
+        # its history over keeps 回退 working after a rename-in-place; dropping
+        # it would silently erase the rollback chain the user can still see.
+        previous = next((c for c in customs if c.get("name") == body.name.strip()), None)
         customs = [c for c in customs if c.get("name") != body.name.strip()]
-        customs.append({
+        entry = {
             "name": body.name.strip(),
             "kind": body.kind,
             "binary_path": str(binary_path),
-        })
+        }
+        history = list((previous or {}).get("history") or [])
+        old_path = str((previous or {}).get("binary_path") or "")
+        # Re-registering also displaces a binary, so it belongs in the chain —
+        # otherwise 回退 silently skips the file that was in use a minute ago.
+        if old_path and Path(old_path).resolve() != binary_path:
+            ver = await local_version(Path(old_path))
+            history.insert(0, {
+                "binary_path": old_path,
+                "version": ver.get("raw") or "unknown",
+                "at": datetime.datetime.now().isoformat(timespec="seconds"),
+            })
+        if history:
+            entry["history"] = history[:_MAX_CUSTOM_HISTORY]
+        customs.append(entry)
         cfg["custom_engines"] = customs
         with open("config.yaml", "w", encoding="utf-8") as f:
             yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
@@ -203,6 +222,148 @@ async def engine_add_custom(body: CustomEngineBody):
         raise HTTPException(status_code=500, detail=f"保存自定义引擎失败: {e}")
     engine_registry.invalidate()
     return {"status": "ok", "custom_engines": cfg["custom_engines"]}
+
+
+@router.get("/engine/custom")
+async def engine_list_custom():
+    """Registered custom engines, with the history each swap left behind.
+
+    Kept separate from ``/engine/discover``: discovery scans the filesystem and
+    returns candidates, this returns what the user actually committed to
+    config.yaml — including the previous ``binary_path`` entries the GUI offers
+    to roll back to.
+    """
+    try:
+        cfg = yaml.safe_load(open("config.yaml", encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001
+        cfg = {}
+    return {"custom_engines": cfg.get("custom_engines", []) or []}
+
+
+class CustomEngineUpdateBody(BaseModel):
+    name: str
+    binary_path: str
+
+
+_MAX_CUSTOM_HISTORY = 10
+
+
+def _write_customs(customs: list[dict]) -> None:
+    with open("config.yaml", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    cfg["custom_engines"] = customs
+    with open("config.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+
+
+def _find_custom(customs: list[dict], name: str) -> dict:
+    entry = next((c for c in customs if c.get("name") == name), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"未登记该自定义引擎: {name}")
+    return entry
+
+
+@router.post("/engine/custom/update")
+async def engine_update_custom(body: CustomEngineUpdateBody):
+    """Re-point a custom engine at another binary, remembering the old one.
+
+    This is deliberately a *registration* swap, not a file copy: a custom engine
+    is often a whole runtime directory (exe + its DLLs), and half-replacing it
+    is worse than the old version still sitting where it was. Rollback restores
+    the previous registration, so "上一版" means "上一个你登记的这个文件".
+    """
+    name = body.name.strip()
+    new_path = _validate_custom_engine_path(body.binary_path)
+    try:
+        cfg = yaml.safe_load(open("config.yaml", encoding="utf-8")) or {}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"读取配置失败: {e}")
+    customs = cfg.get("custom_engines", []) or []
+    entry = _find_custom(customs, name)
+    old_path = str(entry.get("binary_path") or "")
+    if Path(old_path).resolve() == new_path:
+        return {"status": "already_current", "name": name, "binary_path": str(new_path)}
+
+    # ---- guardian: ask user before changing config ----
+    req = await config_guardian.submit(
+        endpoint="POST /api/engine/custom/update",
+        description=f"更换自定义引擎 {name} 的二进制：{old_path or '（未登记）'} → {new_path}",
+        parameters={"name": name, "from": old_path, "to": str(new_path)},
+    )
+    approved = await config_guardian.wait_for_approval(req)
+    if not approved:
+        raise HTTPException(status_code=403, detail="用户已拒绝此配置变更")
+    # ---- end guardian ----
+
+    history = list(entry.get("history") or [])
+    if old_path:
+        ver = await local_version(Path(old_path))
+        history.insert(0, {
+            "binary_path": old_path,
+            "version": ver.get("raw") or "unknown",
+            "at": datetime.datetime.now().isoformat(timespec="seconds"),
+        })
+    entry["history"] = history[:_MAX_CUSTOM_HISTORY]
+    entry["binary_path"] = str(new_path)
+    try:
+        _write_customs(customs)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"保存自定义引擎失败: {e}")
+    engine_registry.invalidate()
+    return {"status": "updated", "name": name, "binary_path": str(new_path),
+            "history": entry["history"]}
+
+
+@router.post("/engine/custom/rollback")
+async def engine_rollback_custom(name: str = Query(...)):
+    """Restore the previously registered binary for a custom engine."""
+    name = name.strip()
+    try:
+        cfg = yaml.safe_load(open("config.yaml", encoding="utf-8")) or {}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"读取配置失败: {e}")
+    customs = cfg.get("custom_engines", []) or []
+    entry = _find_custom(customs, name)
+    history = list(entry.get("history") or [])
+    if not history:
+        raise HTTPException(status_code=404, detail="没有可回退的历史登记")
+    target = history[0]
+    target_path = Path(str(target.get("binary_path") or ""))
+    if not target_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"上一版引擎文件已不在原处，无法回退：{target_path}",
+        )
+
+    # ---- guardian: ask user before changing config ----
+    req = await config_guardian.submit(
+        endpoint="POST /api/engine/custom/rollback",
+        description=f"回退自定义引擎 {name}：{entry.get('binary_path')} → {target_path}",
+        parameters={"name": name, "from": entry.get("binary_path"), "to": str(target_path)},
+    )
+    approved = await config_guardian.wait_for_approval(req)
+    if not approved:
+        raise HTTPException(status_code=403, detail="用户已拒绝此配置变更")
+    # ---- end guardian ----
+
+    old_path = str(entry.get("binary_path") or "")
+    current_ver = await local_version(Path(old_path)) if old_path else {}
+    history.pop(0)
+    if old_path:
+        history.insert(0, {
+            "binary_path": old_path,
+            "version": current_ver.get("raw") or "unknown",
+            "at": datetime.datetime.now().isoformat(timespec="seconds"),
+        })
+    entry["history"] = history[:_MAX_CUSTOM_HISTORY]
+    entry["binary_path"] = str(target_path)
+    try:
+        _write_customs(customs)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"保存自定义引擎失败: {e}")
+    engine_registry.invalidate()
+    return {"status": "rolled_back", "name": name, "binary_path": str(target_path),
+            "history": entry["history"]}
 
 
 @router.get("/engine/update-status")
