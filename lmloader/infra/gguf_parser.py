@@ -1,5 +1,6 @@
 """GGUF file parser for extracting model metadata."""
 
+import re
 import struct
 from pathlib import Path
 from typing import Optional
@@ -10,6 +11,12 @@ import gguf
 from gguf.gguf_reader import GGUFValueType
 
 from lmloader.logger import logger
+
+# Bump whenever parse_gguf gains a field an existing record cannot compute from
+# what it already stores. scanner._fingerprint mixes this into its cache key, so
+# a new field reaches already-registered models on the next scan instead of
+# silently staying absent (the planner would then fall back forever).
+PARSER_SCHEMA = 2
 
 _BONSAI_QUANT_MAP = {
     141: "PQ2_0_TERNARY",
@@ -65,6 +72,11 @@ def _register_bonsai_types():
 
 _register_bonsai_types()
 
+# Routed-expert tensor-name markers, and the shared-expert names that must not
+# be mistaken for them. See _read_expert_shape.
+_ROUTED_EXPERT_MARKERS = ("_exps", "expw")
+_SHARED_EXPERT_MARKERS = ("shexp", "shared_exp")
+
 
 class GGUFMetadata:
     def __init__(
@@ -83,6 +95,14 @@ class GGUFMetadata:
         raw_metadata: dict,
         decision_type: str = "",
         vocab_size: int = 0,
+        expert_count: int = 0,
+        expert_used: int = 0,
+        moe_layer_count: int = 0,
+        expert_bytes: int = 0,
+        attention_head_count_kv: int = 0,
+        attention_key_length: int = 0,
+        attention_value_length: int = 0,
+        full_attention_interval: int = 0,
     ):
         self.architecture = architecture
         self.quantization = quantization
@@ -97,7 +117,23 @@ class GGUFMetadata:
         self.supports_mtp = supports_mtp
         self.decision_type = decision_type
         self.vocab_size = vocab_size
+        self.expert_count = expert_count
+        self.expert_used = expert_used
+        self.moe_layer_count = moe_layer_count
+        self.expert_bytes = expert_bytes
+        self.attention_head_count_kv = attention_head_count_kv
+        self.attention_key_length = attention_key_length
+        self.attention_value_length = attention_value_length
+        self.full_attention_interval = full_attention_interval
         self.raw_metadata = raw_metadata
+
+    @property
+    def is_moe(self) -> bool:
+        # Both halves must be present: a converter that omits expert_count but
+        # still stores `.exps.` tensors (or the reverse) leaves the offload
+        # planner without a per-expert byte cost, so it must fall back to dense
+        # handling rather than guess.
+        return self.expert_count > 0 and self.expert_bytes > 0
 
     def to_dict(self) -> dict:
         return {
@@ -114,6 +150,14 @@ class GGUFMetadata:
             "supports_mtp": self.supports_mtp,
             "decision_type": self.decision_type,
             "vocab_size": self.vocab_size,
+            "expert_count": self.expert_count,
+            "expert_used": self.expert_used,
+            "moe_layer_count": self.moe_layer_count,
+            "expert_bytes": self.expert_bytes,
+            "attention_head_count_kv": self.attention_head_count_kv,
+            "attention_key_length": self.attention_key_length,
+            "attention_value_length": self.attention_value_length,
+            "full_attention_interval": self.full_attention_interval,
         }
 
 
@@ -199,6 +243,9 @@ def parse_gguf(file_path: str, force: bool = False) -> Optional[GGUFMetadata]:
             or next((v for k, v in raw_metadata.items()
                      if k.endswith(".decision.type")), ""),
             vocab_size=vocab_size,
+            **_read_expert_shape(reader, architecture),
+            **_read_kv_shape(reader, architecture, embedding_length,
+                             attention_head_count),
         )
 
         logger.info(f"Parsed GGUF: {path.name} - {architecture} {quantization} {parameters}")
@@ -345,6 +392,115 @@ def _get_parameters(reader: gguf.GGUFReader, architecture: str = "") -> str:
         return _format_parameters(estimated)
 
     return "unknown"
+
+
+def _read_int_alias(reader, architecture, *suffixes):
+    """Read the first `{arch}.{suffix}` (or any `*.{suffix}`) int field that exists.
+
+    Converters disagree twice over: on the arch prefix (a qwen3moe file may
+    store its expert fields under a name that does not match
+    general.architecture) and on the field name itself (qwen3moe ships
+    `expert_used_count`, llama.cpp's own writer says `expert_used`, deepseek2
+    says `n_routed_experts`). An exact-key miss is therefore not evidence that
+    the model lacks the value, and neither is a suffix miss.
+    """
+    for suffix in suffixes:
+        value = _get_int(reader, f"{architecture}.{suffix}") or 0
+        if value:
+            return value
+        for key in reader.fields:
+            if key.startswith("GGUF.") or not key.endswith(f".{suffix}"):
+                continue
+            value = _get_int(reader, key) or 0
+            if value:
+                return value
+    return 0
+
+
+def _read_expert_shape(reader: gguf.GGUFReader, architecture: str) -> dict:
+    """Collect the routed-expert geometry the offload planner needs.
+
+    Only *routed* experts count: they are the tensors `-ot`/`-ncmoe` can keep
+    on CPU, while shared experts (`shexp`) fire on every token and must stay
+    resident. Naming is converter-dependent (`_exps` for qwen3moe/deepseek2,
+    `expw` for gpt-oss), so the census is by tensor name rather than one
+    hardcoded pattern, and a layer count read from metadata wins over the
+    number of layers that happened to carry expert tensors.
+    """
+    expert_count = _read_int_alias(reader, architecture,
+                                   "expert_count", "n_routed_experts")
+    expert_used = _read_int_alias(reader, architecture,
+                                  "expert_used", "expert_used_count",
+                                  "num_experts_per_tok", "experts_per_tok")
+
+    expert_bytes = 0
+    expert_layers = set()
+    packed_experts = 0
+    for tensor in reader.tensors:
+        name = str(getattr(tensor, "name", ""))
+        lowered = name.lower()
+        if not any(marker in lowered for marker in _ROUTED_EXPERT_MARKERS):
+            continue
+        if any(marker in lowered for marker in _SHARED_EXPERT_MARKERS):
+            continue
+        try:
+            expert_bytes += int(tensor.n_bytes)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        layer = re.search(r"(?:^|\.)blk\.(\d+)\.", name)
+        if layer:
+            expert_layers.add(int(layer.group(1)))
+        # A 3-D `_exps` tensor is one whole layer's experts stored together
+        # (llama.cpp's layout: expert count is the outermost axis). That is the
+        # number the planner divides expert_bytes by, and converters that omit
+        # the metadata field still cannot hide it here.
+        shape = getattr(tensor, "shape", None)
+        if shape is not None and len(shape) >= 3:
+            packed_experts = max(packed_experts, int(shape[0]))
+
+    if not expert_count:
+        expert_count = packed_experts
+
+    moe_layer_count = _read_int_alias(reader, architecture, "moe_layer_count")
+    if not moe_layer_count:
+        moe_layer_count = len(expert_layers)
+
+    return {
+        "expert_count": expert_count,
+        "expert_used": expert_used,
+        "moe_layer_count": moe_layer_count,
+        "expert_bytes": expert_bytes,
+    }
+
+
+def _read_kv_shape(reader, architecture, embedding_length, head_count) -> dict:
+    """Collect the per-token KV-cache geometry the memory budget needs.
+
+    The budget used to assume 2*embedding_length elements per layer per token,
+    i.e. one KV set as wide as the whole hidden vector on every layer. Real
+    files are narrower on two axes at once: GQA stores `head_count_kv` far below
+    `head_count`, and hybrid models (qwen35moe, qwen3next) keep a KV cache only
+    on every `full_attention_interval`-th layer — the others are recurrent
+    states that cost O(1) per slot, not O(ctx). On the user's 35B-A3B the old
+    assumption was 16x too pessimistic: the planner reserved most of a 16GB card
+    for a cache llama.cpp itself measured at 128 MiB, which is what starved the
+    expert-offload decision it is supposed to feed.
+    """
+    kv_heads = _read_int_alias(reader, architecture, "attention.head_count_kv")
+    k_len = _read_int_alias(reader, architecture, "attention.key_length")
+    v_len = _read_int_alias(reader, architecture, "attention.value_length") or k_len
+    interval = _read_int_alias(reader, architecture, "full_attention_interval")
+    if not kv_heads:
+        kv_heads = head_count
+    if not (k_len or v_len):
+        head_dim = embedding_length // head_count if head_count else 0
+        k_len = v_len = head_dim
+    return {
+        "attention_head_count_kv": kv_heads,
+        "attention_key_length": k_len,
+        "attention_value_length": v_len,
+        "full_attention_interval": interval,
+    }
 
 
 def _get_string(reader: gguf.GGUFReader, key: str) -> Optional[str]:

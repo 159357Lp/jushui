@@ -8,7 +8,7 @@ from typing import Optional
 from lmloader.config import settings
 from lmloader.engine.kinds import MODEL_FORMATS
 from lmloader.infra.database import ModelRecord, db
-from lmloader.infra.gguf_parser import parse_gguf
+from lmloader.infra.gguf_parser import PARSER_SCHEMA, parse_gguf
 from lmloader.logger import logger
 
 # Single-file formats we register (beyond .gguf which gets full GGUF parsing)
@@ -20,7 +20,10 @@ FP_KEY = "_fp"
 
 
 def _fingerprint(stat_result: os.stat_result) -> str:
-    return f"{stat_result.st_size}:{stat_result.st_mtime_ns}"
+    # PARSER_SCHEMA is part of the key, not just of the parse: a record cached
+    # under an older schema is missing fields the planner needs, and size/mtime
+    # alone never change when the parser gains one.
+    return f"{PARSER_SCHEMA}:{stat_result.st_size}:{stat_result.st_mtime_ns}"
 
 
 class ModelScanner:
