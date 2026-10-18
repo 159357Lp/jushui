@@ -22,6 +22,10 @@ _PALETTES = {
     "dark": {
         "bg": "#0d1117",            # window / input background
         "surface": "#161b22",       # cards, groups, sidebar
+        # Never washed by the wallpaper slider below — forms pages (settings/
+        # logs) force these so the picture never bleeds through dense form fields.
+        "surface_solid": "#161b22",
+        "bg_solid": "#0d1117",
         "surface_hover": "#1c2129",
         "btn": "#21262d",
         "btn_hover": "#30363d",
@@ -77,6 +81,9 @@ _PALETTES = {
     "light": {
         "bg": "#F5F6FA",            # app canvas
         "surface": "#FFFFFF",       # cards / panels
+        # Never washed by the wallpaper slider — forms pages force these solid.
+        "surface_solid": "#FFFFFF",
+        "bg_solid": "#F5F6FA",
         "surface_hover": "#F8F9FC",
         "btn": "#FFFFFF",
         "btn_hover": "#F1F3F9",
@@ -166,6 +173,36 @@ def hexify(value: str) -> str:
     return value
 
 
+def _rgb(value: str) -> tuple[int, int, int]:
+    """Hex, ``rgba()`` or a token name as three channels."""
+    value = value if value.startswith(("#", "rgba(")) else c(value)
+    value = hexify(value)
+    return tuple(int(value[i:i + 2], 16) for i in (1, 3, 5))  # type: ignore[return-value]
+
+
+def mix(under: str, over: str, alpha: float) -> str:
+    """`over` laid on top of `under` at `alpha`, returned as a solid #RRGGBB."""
+    base, top = _rgb(under), _rgb(over)
+    return "#{:02X}{:02X}{:02X}".format(
+        *(round(base[i] + (top[i] - base[i]) * alpha) for i in range(3)))
+
+
+def luminance(value: str) -> float:
+    """WCAG relative luminance of a colour (sRGB, gamma-expanded)."""
+    def channel(u8: int) -> float:
+        v = u8 / 255.0
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+
+    r, g, b = _rgb(value)
+    return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+
+
+def contrast(ink: str, behind: str) -> float:
+    """WCAG contrast ratio, 1.0 (invisible) to 21.0 (black on white)."""
+    a, b = luminance(ink), luminance(behind)
+    return (max(a, b) + 0.05) / (min(a, b) + 0.05)
+
+
 def with_panel_alpha(tokens: dict, alpha: float) -> dict:
     """The paint view of a palette: the page canvas at `alpha`, every card solid.
 
@@ -191,16 +228,9 @@ def tint(colour: str, alpha: float, over: str = "bg") -> str:
     A "#RRGGBBAA" suffix is not usable in QSS: QColor reads the leading pair as
     alpha, so "#58a6ff22" paints a lime badge instead of a blue one. Washes are
     therefore mixed here, which also keeps them following a custom palette.
-    `colour` may be a token name or a literal hex.
+    `colour` may be a token name, a literal hex, or an ``rgba()`` value.
     """
-    def rgb(value: str) -> tuple[int, int, int]:
-        value = value if value.startswith(("#", "rgba(")) else c(value)
-        value = hexify(value)
-        return tuple(int(value[i:i + 2], 16) for i in (1, 3, 5))  # type: ignore[return-value]
-
-    base, top = rgb(over), rgb(colour)
-    return "#{:02X}{:02X}{:02X}".format(
-        *(round(base[i] + (top[i] - base[i]) * alpha) for i in range(3)))
+    return mix(over, colour, alpha)
 
 
 _DARK_QSS = r"""
@@ -597,6 +627,30 @@ QSplitter::handle:horizontal {
     border: 1px solid ${control_border};
     border-radius: 8px;
     padding: 10px;
+}
+
+/* 壁纸分页纪律：表单密集型页置 solidPanel=true 后强制实底，壁纸不再透过
+   输入框/卡片，文字对比度回到 WCAG AA；浏览型页（模型库/对话）不受影响。 */
+*[solidPanel="true"] {
+    background-color: ${bg_solid};
+}
+
+*[solidPanel="true"] QGroupBox {
+    background-color: ${surface_solid};
+}
+
+*[solidPanel="true"] QLineEdit,
+*[solidPanel="true"] QSpinBox,
+*[solidPanel="true"] QDoubleSpinBox,
+*[solidPanel="true"] QComboBox,
+*[solidPanel="true"] QTableWidget,
+*[solidPanel="true"] QTextEdit {
+    background-color: ${surface_solid};
+}
+
+*[solidPanel="true"] QScrollArea,
+*[solidPanel="true"] QScrollArea > QWidget > QWidget {
+    background-color: ${bg_solid};
 }
 """
 
@@ -1012,6 +1066,29 @@ QSplitter::handle:horizontal {
     border-radius: 14px;
     padding: 12px;
 }
+
+/* 壁纸分页纪律：表单密集型页置 solidPanel=true 后强制实底（见深色主题同款）。 */
+*[solidPanel="true"] {
+    background-color: ${bg_solid};
+}
+
+*[solidPanel="true"] QGroupBox {
+    background-color: ${surface_solid};
+}
+
+*[solidPanel="true"] QLineEdit,
+*[solidPanel="true"] QSpinBox,
+*[solidPanel="true"] QDoubleSpinBox,
+*[solidPanel="true"] QComboBox,
+*[solidPanel="true"] QTableWidget,
+*[solidPanel="true"] QTextEdit {
+    background-color: ${surface_solid};
+}
+
+*[solidPanel="true"] QScrollArea,
+*[solidPanel="true"] QScrollArea > QWidget > QWidget {
+    background-color: ${bg_solid};
+}
 """
 
 _QSS_TEMPLATES = {"dark": Template(_DARK_QSS), "light": Template(_LIGHT_QSS)}
@@ -1092,6 +1169,102 @@ def wallpaper_state() -> dict | None:
     return _wallpaper
 
 
+TEXT_CONTRAST_FLOOR = 4.5
+"""WCAG's body-text bar. Anything below it is what "字看不清" actually measures."""
+
+SOFT_TEXT_FLOOR = 3.0
+"""Secondary ink. Over a mid-grey painting, 4.5:1 forces body and secondary text
+onto the same near-black, so the hierarchy is paid for with legibility it never
+needed; 3.0 keeps 次要文字 visibly 次要."""
+
+INK_FLOORS = {"muted": SOFT_TEXT_FLOOR, "dim": SOFT_TEXT_FLOOR}
+
+
+def ink_for(colour: str, behind: str, floor: float = TEXT_CONTRAST_FLOOR) -> str:
+    """`colour` moved toward whichever extreme `behind` leaves room for.
+
+    Only the colour itself moves, so a theme that already reads stays
+    byte-identical and light ink over a pale painting comes out as its dark
+    version — hue preserved, no new palette derived.
+    """
+    if contrast(colour, behind) >= floor:
+        return colour
+    best, best_ratio = colour, contrast(colour, behind)
+    for target in ("#000000", "#FFFFFF"):
+        for step in range(1, 21):
+            candidate = mix(colour, target, step / 20)
+            ratio = contrast(candidate, behind)
+            if ratio >= floor:
+                return candidate
+            if ratio > best_ratio:
+                best, best_ratio = candidate, ratio
+    return best
+
+
+def _visible(fill: str, art: str) -> str:
+    """What a QSS background value actually leaves on screen over `art`."""
+    if fill in ("transparent", "", "none"):
+        return art
+    if fill.startswith("rgba("):
+        r, g, b, a = (part.strip() for part in fill[5:-1].split(","))
+        return mix(art, "#{:02X}{:02X}{:02X}".format(int(r), int(g), int(b)), float(a))
+    return fill
+
+
+_artwork: str | None = None
+_ink_cache: dict[tuple[str, str], str] = {}
+
+
+def set_artwork(colour: str | None) -> None:
+    """Publish the colour painted behind every panel; invalidates the ink cache."""
+    global _artwork
+    _artwork = colour
+    _ink_cache.clear()
+
+
+def artwork() -> str | None:
+    return _artwork
+
+
+def card_ink(fill: str, role: str = "fg") -> str:
+    """`role`'s colour, resolved against what is *really* behind the glyphs.
+
+    A token's hex is not the backdrop while a picture is painted: a container
+    paints ``transparent`` (the picture is behind it) and a card paints
+    ``rgba(r, g, b, .35)`` (its wash over the picture is). Text on a genuinely
+    solid fill keeps the palette's ink untouched — that is the point: buttons,
+    dialogs and menus do not sit on the painting and must not be recoloured by it.
+    """
+    colour = c(role)
+    if _artwork is None:
+        return colour
+    key = (fill, role)
+    if key not in _ink_cache:
+        _ink_cache[key] = ink_for(colour, _visible(fill, _artwork),
+                                  INK_FLOORS.get(role, TEXT_CONTRAST_FLOOR))
+    return _ink_cache[key]
+
+
+def canvas_ink(role: str = "fg") -> str:
+    """Ink for text sitting on a :func:`canvas` container, i.e. on the picture."""
+    return card_ink("transparent", role)
+
+
+def artwork_colour(tokens: dict, state: dict | None) -> str | None:
+    """The average colour the picture actually leaves on screen, or None.
+
+    ``WallpaperHost`` fills with ``bg`` and then lays the painting on top at
+    ``strength``, so the number text has to fight is that composite — not the
+    file's own mean.
+    """
+    if not state:
+        return None
+    from lmloader.gui import wallpaper
+
+    mean = wallpaper.average_colour(state["source"])
+    return None if mean is None else mix(tokens["bg"], mean, state["strength"])
+
+
 def apply_theme(app, name: str, overrides: dict | None = None, wallpaper: dict | None = None):
     """Switch the running app's theme; safe to call anytime.
 
@@ -1107,6 +1280,7 @@ def apply_theme(app, name: str, overrides: dict | None = None, wallpaper: dict |
     state = set_wallpaper(wallpaper)
     panel = state["panel_alpha"] if state else 1.0
     hex_tokens = theme_tokens(name, overrides)
+    set_artwork(artwork_colour(hex_tokens, state))
     if overrides or panel < 1.0:
         _PALETTES["custom"] = with_panel_alpha(hex_tokens, panel)
         current_theme = "custom"

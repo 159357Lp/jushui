@@ -4,7 +4,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QSpinBox, QCheckBox, QPushButton, QLabel,
     QGroupBox, QFileDialog, QMessageBox, QComboBox, QScrollArea,
-    QTableWidget, QTableWidgetItem, QHeaderView,
+    QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy,
 )
 from PySide6.QtCore import Qt, Signal
 import yaml
@@ -50,6 +50,8 @@ class SettingsPage(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
         layout.setSpacing(12)
+        # 壁纸分页纪律：设置页是表单密集型页，强制实底、不让山水壁纸透到输入框。
+        self.setProperty("solidPanel", True)
 
         title = QLabel(tr("settings.title"))
         title.setObjectName("title")
@@ -60,35 +62,33 @@ class SettingsPage(QWidget):
         scroll_layout.setContentsMargins(0, 0, 0, 0)
         scroll_layout.setSpacing(14)
 
-        # ① Engines: three equal-width cards, config only. Version/update
-        # controls used to be embedded in the two left cards, which made the
-        # page a stack of forms of different heights.
+        # ① 引擎二选一：标准 + 三进制两张等宽等高卡。可播放引擎内容最多，
+        #    单独占整行（见 ⑦），避免塞进 1/3 列被挤成超高的瘦卡。
         engines = QHBoxLayout()
         engines.setSpacing(12)
-        # AlignTop: without it every card is stretched to the tallest one and the
-        # two short cards become empty boxes.
-        engines.addWidget(self._build_engine_group(tr("settings.primary_engine"), "primary"), 1, Qt.AlignTop)
-        engines.addWidget(self._build_engine_group(tr("settings.ternary_engine"), "ternary"), 1, Qt.AlignTop)
-        engines.addWidget(self._build_pluggable_group(), 1, Qt.AlignTop)
+        engines.addWidget(self._build_engine_group(tr("settings.primary_engine"), "primary"), 1)
+        engines.addWidget(self._build_engine_group(tr("settings.ternary_engine"), "ternary"), 1)
         scroll_layout.addLayout(engines)
 
-        # ② Versions: one row per engine, slots first, then custom registrations
-        # and anything else discovery found.
+        # ② 引擎版本：全宽表格，路径列自动省略、操作列自适应宽度。
         scroll_layout.addWidget(self._build_version_group())
 
-        # ③④ Server + appearance side by side.
+        # ③④ 服务 + 外观 并排（等高）。
         row2 = QHBoxLayout()
         row2.setSpacing(12)
-        row2.addWidget(self._build_server_group(), 1, Qt.AlignTop)
-        row2.addWidget(self._build_appearance_group(), 1, Qt.AlignTop)
+        row2.addWidget(self._build_server_group(), 1)
+        row2.addWidget(self._build_appearance_group(), 1)
         scroll_layout.addLayout(row2)
 
-        # ⑤⑥ Paths + downloads side by side.
+        # ⑤⑥ 路径 + 下载 并排（等高）。
         row3 = QHBoxLayout()
         row3.setSpacing(12)
-        row3.addWidget(self._build_paths_group(), 1, Qt.AlignTop)
-        row3.addWidget(self._build_download_group(), 1, Qt.AlignTop)
+        row3.addWidget(self._build_paths_group(), 1)
+        row3.addWidget(self._build_download_group(), 1)
         scroll_layout.addLayout(row3)
+
+        # ⑦ 可播放引擎：内容多，独占整行、内部两栏排布。
+        scroll_layout.addWidget(self._build_pluggable_group())
 
         scroll_layout.addStretch()
 
@@ -112,6 +112,7 @@ class SettingsPage(QWidget):
 
     def _build_engine_group(self, title: str, slot: str) -> QGroupBox:
         group = QGroupBox(title)
+        group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         form = QFormLayout(group)
         form.setSpacing(8)
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
@@ -154,17 +155,24 @@ class SettingsPage(QWidget):
         return group
 
     def _build_pluggable_group(self) -> QGroupBox:
-        """Third engine card: search dirs + custom engine registration."""
+        """其他格式引擎：扫描目录 + 自定义注册。独占整行，内部两栏排布，
+        避免塞进 1/3 列被挤成超高的瘦卡。"""
         group = QGroupBox(tr("settings.pluggable_engine"))
-        form = QFormLayout(group)
-        form.setSpacing(8)
-        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        vbox = QVBoxLayout(group)
+        vbox.setSpacing(10)
 
         tip = QLabel(tr("settings.pluggable_tip"))
         tip.setObjectName("subtitle")
         tip.setWordWrap(True)
-        form.addRow(tip)
+        vbox.addWidget(tip)
 
+        cols = QHBoxLayout()
+        cols.setSpacing(28)
+
+        # 左栏：引擎扫描
+        left = QFormLayout()
+        left.setSpacing(8)
+        left.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         self.scan_dirs_edit = QLineEdit()
         self.scan_dirs_edit.setPlaceholderText("D:/engines;D:/rwkv")
         self.save_dirs_btn = QPushButton(tr("settings.save_dirs"))
@@ -172,21 +180,26 @@ class SettingsPage(QWidget):
         dirs_row = QHBoxLayout()
         dirs_row.addWidget(self.scan_dirs_edit, 1)
         dirs_row.addWidget(self.save_dirs_btn)
-        form.addRow(tr("settings.engine_scan_dirs"), dirs_row)
+        left.addRow(tr("settings.engine_scan_dirs"), dirs_row)
 
         self.rescan_btn = QPushButton(tr("settings.rescan"))
         self.rescan_btn.clicked.connect(self._refresh_engines)
         rescan_row = QHBoxLayout()
         rescan_row.addWidget(self.rescan_btn)
         rescan_row.addStretch()
-        form.addRow("", rescan_row)
+        left.addRow("", rescan_row)
+        cols.addLayout(left, 1)
 
+        # 右栏：自定义引擎注册
+        right = QFormLayout()
+        right.setSpacing(8)
+        right.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         self.custom_name_edit = QLineEdit()
         self.custom_name_edit.setPlaceholderText(tr("settings.engine_name_ph"))
-        form.addRow(tr("settings.engine_name"), self.custom_name_edit)
+        right.addRow(tr("settings.engine_name"), self.custom_name_edit)
 
         self.custom_kind_combo = QComboBox()
-        form.addRow(tr("settings.engine_type"), self.custom_kind_combo)
+        right.addRow(tr("settings.engine_type"), self.custom_kind_combo)
 
         self.custom_path_edit = QLineEdit()
         self.custom_path_edit.setPlaceholderText("D:/engines/rwkv-server.exe")
@@ -195,7 +208,7 @@ class SettingsPage(QWidget):
         path_row = QHBoxLayout()
         path_row.addWidget(self.custom_path_edit, 1)
         path_row.addWidget(browse_btn)
-        form.addRow(tr("settings.engine_path"), path_row)
+        right.addRow(tr("settings.engine_path"), path_row)
 
         self.add_engine_btn = QPushButton(tr("settings.add_engine"))
         self.add_engine_btn.setObjectName("primary")
@@ -203,8 +216,10 @@ class SettingsPage(QWidget):
         add_row = QHBoxLayout()
         add_row.addWidget(self.add_engine_btn)
         add_row.addStretch()
-        form.addRow("", add_row)
+        right.addRow("", add_row)
+        cols.addLayout(right, 1)
 
+        vbox.addLayout(cols)
         return group
 
     def _build_version_group(self) -> QGroupBox:
@@ -223,19 +238,19 @@ class SettingsPage(QWidget):
             tr("settings.col_engine"), tr("settings.col_kind"), tr("settings.col_path"),
             tr("settings.engine_formats"), tr("settings.col_version"), tr("settings.col_action"),
         ])
+        # 长路径列左省略（…前缀）避免把右侧「操作」列挤出可视区（横向滚动已禁用）。
+        table.setTextElideMode(Qt.ElideLeft)
         header = table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.Stretch)
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.Interactive)
-        header.setSectionResizeMode(5, QHeaderView.Interactive)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
         table.verticalHeader().setVisible(False)
         # Cell widgets (multi-line version labels, button rows) do not drive row
         # height, so the default has to leave room for them.
         table.verticalHeader().setDefaultSectionSize(72)
-        table.setColumnWidth(4, 300)
-        table.setColumnWidth(5, 330)
         table.setEditTriggers(QTableWidget.NoEditTriggers)
         table.setMaximumHeight(460)
         self.version_table = table
@@ -786,6 +801,7 @@ class SettingsPage(QWidget):
 
     def _build_server_group(self) -> QGroupBox:
         group = QGroupBox(tr("settings.server"))
+        group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         form = QFormLayout(group)
 
         port_start = QSpinBox()
@@ -809,6 +825,7 @@ class SettingsPage(QWidget):
 
     def _build_appearance_group(self) -> QGroupBox:
         group = QGroupBox(tr("settings.appearance"))
+        group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         form = QFormLayout(group)
 
         lang_combo = QComboBox()
@@ -840,6 +857,7 @@ class SettingsPage(QWidget):
 
     def _build_paths_group(self) -> QGroupBox:
         group = QGroupBox(tr("settings.paths"))
+        group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         form = QFormLayout(group)
 
         model_dir = QLineEdit()
@@ -861,6 +879,7 @@ class SettingsPage(QWidget):
 
     def _build_download_group(self) -> QGroupBox:
         group = QGroupBox(tr("settings.download"))
+        group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         form = QFormLayout(group)
 
         proxy = QLineEdit()

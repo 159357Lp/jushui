@@ -72,7 +72,7 @@ def palette_restored(qapp):        # 依赖 qapp：这样每个用例都一定�
 
     app = QApplication.instance()
     theme, custom, state = styles.current_theme, styles._PALETTES.get("custom"), styles.wallpaper_state()
-    sheet = app.styleSheet() if app is not None else ""
+    art, sheet = styles.artwork(), app.styleSheet() if app is not None else ""
     yield
     styles.current_theme = theme
     if custom is None:
@@ -80,6 +80,7 @@ def palette_restored(qapp):        # 依赖 qapp：这样每个用例都一定�
     else:
         styles._PALETTES["custom"] = custom
     styles.set_wallpaper(state)
+    styles.set_artwork(art)
     if app is not None and app.styleSheet() != sheet:
         app.setStyleSheet(sheet)
 
@@ -130,6 +131,87 @@ def test_chat_containers_ask_canvas_not_c():
                    "chatMessages {{ background-color: {canvas('bg')}",
                    "QWidget#chatComposer {{ background-color: {canvas('surface')}"):
         assert needle in src, f"容器样式改回实色了：{needle}"
+
+
+PALE_ART = "#E8ECEF"
+"""一幅浅得能把浅色正文吃掉的画——山水画取色后就是这个色。"""
+
+
+def _publish_solid():
+    """先把 dark 调色板发布出去（不建窗口），后面都在比这一套色。"""
+    styles.apply_theme(FakeApp(), "dark", None, None)
+
+
+def test_ink_moves_only_where_the_picture_shows():
+    """画上的字改色，实心面上的字一个字节都不动——弹窗、按钮、下拉面板不在画上。"""
+    _publish_solid()
+    ink = styles.c("fg")
+    assert styles.contrast(ink, PALE_ART) < styles.TEXT_CONTRAST_FLOOR, "换个更浅的画，这条判据就没得测了"
+    styles.set_artwork(PALE_ART)
+    moved = styles.canvas_ink("fg")
+    assert moved != ink
+    assert styles.contrast(moved, PALE_ART) >= styles.TEXT_CONTRAST_FLOOR
+    assert HEX6.match(moved), f"墨色必须是十六进制（{moved}），QPalette 和 QSS 都只认这个"
+    for fill in (styles.c("bg"), styles.c("btn"), styles.c("log_bg"), styles.c("surface")):
+        assert styles.card_ink(fill, "fg") == ink, f"实心底 {fill} 上的字被画带跑了"
+
+
+def test_no_picture_no_shift():
+    """反向对照：没有背景层时，canvas_ink 必须逐字节等于 c()。"""
+    _publish_solid()
+    styles.set_artwork(None)
+    for role in ("fg", "title", "muted"):
+        assert styles.canvas_ink(role) == styles.c(role)
+
+
+def test_secondary_ink_stays_softer_than_body():
+    """三条墨都得够线，而且层级不能反——浅画上一旦都按 4.5 逼，次要字会比正文还黑。"""
+    _publish_solid()
+    styles.set_artwork(PALE_ART)
+    ratios = [styles.contrast(styles.canvas_ink(role), PALE_ART)
+              for role in ("title", "fg", "muted")]
+    assert ratios[0] >= ratios[1] >= styles.TEXT_CONTRAST_FLOOR, f"标题/正文 {ratios}"
+    assert styles.SOFT_TEXT_FLOOR <= ratios[2] < ratios[1], f"次要字 {ratios[2]:.2f} 没比正文轻"
+
+
+def test_a_card_is_judged_by_how_translucent_it_actually_is():
+    """卡片洗到只剩一层时，字要跟着画走；还是实色时不该动。"""
+    tokens = styles.theme_tokens("dark")
+    _publish_solid()
+    styles.set_artwork(PALE_ART)
+    assert styles.card_ink(tokens["surface"], "fg") == styles.c("fg")
+    washed = styles.with_panel_alpha(tokens, 0.2)["surface"]
+    assert styles.card_ink(washed, "fg") != styles.c("fg"), "rgba(…, .2) 的卡片还按实色配墨 = 看不见"
+
+
+def test_apply_theme_publishes_the_backdrop_and_zero_strength_is_the_palette(palette_restored,
+                                                                            theme_with_picture,
+                                                                            picture):
+    """浓度 0 时屏幕上根本没有画，底色就该原样是 bg——这条抓"没关干净"。"""
+    app = FakeApp()
+    styles.apply_theme(app, theme_with_picture["base"], theme_with_picture["tokens"],
+                       {"enabled": True, "source": str(picture), "strength": 0.0,
+                        "panel_alpha": 0.72})
+    assert styles.artwork() == styles.hexify(styles.c("bg"))
+
+    styles.apply_theme(app, theme_with_picture["base"], theme_with_picture["tokens"],
+                       {"enabled": True, "source": str(picture), "strength": 1.0,
+                        "panel_alpha": 0.72})
+    assert styles.artwork() != styles.hexify(styles.c("bg")), "画全铺了，背色还当自己是纯色"
+
+    styles.apply_theme(app, theme_with_picture["base"], theme_with_picture["tokens"], None)
+    assert styles.artwork() is None
+
+
+def test_chat_text_on_the_picture_asks_for_region_ink():
+    """静态守卫：聊天页落在画上的字一旦改回 c()，深浅两套画就又糊成一片。"""
+    src = Path(styles.__file__).with_name("pages").joinpath("chat.py").read_text(encoding="utf-8")
+    for needle in ("color: {card_ink(bg, 'fg')}",          # 气泡正文跟着卡片虚实走
+                   "color: {canvas_ink('muted')}; font-size: 11px; font-weight: 600;",  # 发送者
+                   "padding: 7px; color: {canvas_ink('fg')}",   # 输入框
+                   "def _section_label_qss(on: str)",      # 共享样式必须显式说清压在什么上面
+                   ):
+        assert needle in src, f"聊天页的墨色又变成全局的了：{needle}"
 
 
 def test_alpha_is_spelled_as_rgba_never_eight_digit_hex():

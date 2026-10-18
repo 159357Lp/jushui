@@ -24,7 +24,7 @@ from lmloader.gui.api_client import (
 from lmloader.gui.icons import copy_icon, download_icon
 from lmloader.gui.i18n import tr
 from lmloader.gui.repetition import detect_repetition_loop
-from lmloader.gui.styles import c, canvas, tint
+from lmloader.gui.styles import c, canvas, canvas_ink, card_ink, tint
 from lmloader.gui.ui_config import load_ui_setting, save_ui_setting
 from lmloader.infra.chat_db import chat_db
 
@@ -120,7 +120,8 @@ class ConversationRow(QWidget):
             c("accent_surface") if getattr(self, "_active", False)
             else c("surface_hover") if self._hovered else "transparent"
         )
-        title_color = c("accent") if getattr(self, "_active", False) else c("muted")
+        title_color = (card_ink(background, "accent") if getattr(self, "_active", False)
+                       else card_ink(background, "muted"))
         title_weight = "600" if getattr(self, "_active", False) else "400"
         self.setStyleSheet(f"""
             ConversationRow {{
@@ -135,7 +136,7 @@ class ConversationRow(QWidget):
             QPushButton#conversationDelete {{
                 padding: 0;
                 min-height: 0;
-                color: {c('muted')};
+                color: {card_ink(background, 'muted')};
                 background: transparent;
                 border: none;
                 border-radius: 8px;
@@ -391,16 +392,17 @@ class ChatPage(QWidget):
         bar_layout.setContentsMargins(10, 5, 8, 5)
         bar_layout.setSpacing(8)
         bar_title = QLabel(tr("chat.prompt_title"))
-        self._bind_style(bar_title, self._section_label_qss)
+        self._bind_style(bar_title, lambda: self._section_label_qss(c('accent_soft')))
         bar_layout.addWidget(bar_title)
         self.prompt_bar_preview = QLabel("")
         self._bind_style(
-            self.prompt_bar_preview, lambda: f"color: {c('muted')}; font-size: 12px;"
+            self.prompt_bar_preview,
+            lambda: f"color: {card_ink(c('accent_soft'), 'muted')}; font-size: 12px;",
         )
         bar_layout.addWidget(self.prompt_bar_preview, 1)
         bar_edit = QPushButton(tr("chat.prompt_edit"))
         bar_edit.setCursor(Qt.PointingHandCursor)
-        self._bind_style(bar_edit, self._mini_action_qss)
+        self._bind_style(bar_edit, lambda: self._mini_action_qss(c('accent_soft')))
         bar_edit.clicked.connect(self._open_prompt_panel)
         bar_layout.addWidget(bar_edit)
         self.prompt_bar.setVisible(False)
@@ -485,7 +487,7 @@ class ChatPage(QWidget):
         toolbar.addStretch()
         input_hint = QLabel(tr("chat.input_hint"))
         self._bind_style(
-            input_hint, lambda: f"color: {c('muted')}; font-size: 11px;"
+            input_hint, lambda: f"color: {canvas_ink('muted')}; font-size: 11px;"
         )
         toolbar.addWidget(input_hint)
         composer_layout.addLayout(toolbar)
@@ -516,7 +518,7 @@ class ChatPage(QWidget):
         self._bind_style(
             self.input_box,
             lambda: f"QTextEdit#chat_input {{ background-color: transparent; border: none;"
-                    f" border-radius: 0; padding: 7px; color: {c('fg')}; }}",
+                    f" border-radius: 0; padding: 7px; color: {canvas_ink('fg')}; }}",
         )
         self.input_box.installEventFilter(self)
         bottom.addWidget(self.input_box, 1)
@@ -602,7 +604,7 @@ class ChatPage(QWidget):
             btn.setToolTip(tr("chat.thinking_on_tip"))
         else:
             btn.setStyleSheet(
-                f"QPushButton {{ color: {c('muted')}; background: transparent;"
+                f"QPushButton {{ color: {canvas_ink('muted')}; background: transparent;"
                 f" border: 1px solid {c('border')}; border-radius: 12px;"
                 " padding: 3px 14px; font-size: 12px; }"
             )
@@ -612,11 +614,12 @@ class ChatPage(QWidget):
 
     @staticmethod
     def _heading_qss() -> str:
-        return f"font-size: 16px; font-weight: 700; color: {c('title')};"
+        # Both headings sit on a canvas container, i.e. straight on the picture.
+        return f"font-size: 16px; font-weight: 700; color: {canvas_ink('title')};"
 
     @staticmethod
-    def _section_label_qss() -> str:
-        return f"color: {c('accent')}; font-size: 12px; font-weight: 600;"
+    def _section_label_qss(on: str) -> str:
+        return f"color: {card_ink(on, 'accent')}; font-size: 12px; font-weight: 600;"
 
     @staticmethod
     def _primary_btn_qss(danger: bool = False) -> str:
@@ -638,7 +641,7 @@ class ChatPage(QWidget):
     @staticmethod
     def _prompt_chip_qss() -> str:
         return (
-            f"QPushButton {{ color: {c('muted')}; background: transparent;"
+            f"QPushButton {{ color: {canvas_ink('muted')}; background: transparent;"
             f" border: 1px solid {c('chip_border')}; border-radius: 12px;"
             " padding: 3px 12px; font-size: 12px; }"
             f" QPushButton:hover {{ color: {c('accent')}; background: {c('accent_soft')};"
@@ -672,7 +675,7 @@ class ChatPage(QWidget):
         head = QHBoxLayout()
         head.setSpacing(8)
         title = QLabel(tr("chat.prompt_title"))
-        self._bind_style(title, self._section_label_qss)
+        self._bind_style(title, lambda: self._section_label_qss(c('bg')))
         head.addWidget(title)
 
         self.prompt_scope = QComboBox()
@@ -695,12 +698,12 @@ class ChatPage(QWidget):
         head.addStretch()
         clear_btn = QPushButton(tr("chat.prompt_clear"))
         clear_btn.setCursor(Qt.PointingHandCursor)
-        self._bind_style(clear_btn, self._mini_action_qss)
+        self._bind_style(clear_btn, lambda: self._mini_action_qss(c('bg')))
         clear_btn.clicked.connect(self._clear_prompt)
         head.addWidget(clear_btn)
         close_btn = QPushButton(tr("chat.prompt_collapse"))
         close_btn.setCursor(Qt.PointingHandCursor)
-        self._bind_style(close_btn, self._mini_action_qss)
+        self._bind_style(close_btn, lambda: self._mini_action_qss(c('bg')))
         close_btn.clicked.connect(lambda: self.prompt_btn.setChecked(False))
         head.addWidget(close_btn)
         box.addLayout(head)
@@ -714,7 +717,7 @@ class ChatPage(QWidget):
             self.prompt_box,
             lambda: f"QTextEdit#chatPromptBox {{ background: {c('surface')};"
                     f" border: 1px solid {c('border')}; border-radius: 8px;"
-                    f" color: {c('fg')}; font-size: 13px; padding: 6px 8px; }}"
+                    f" color: {card_ink(c('surface'), 'fg')}; font-size: 13px; padding: 6px 8px; }}"
                     f" QTextEdit#chatPromptBox:focus {{ border-color: {c('accent')}; }}",
         )
         self.prompt_box.textChanged.connect(self._on_prompt_text_changed)
@@ -723,14 +726,15 @@ class ChatPage(QWidget):
         foot = QHBoxLayout()
         foot.setSpacing(10)
         self.prompt_count = QLabel("")
-        self._bind_style(self.prompt_count, lambda: f"color: {c('fg')}; font-size: 11px;")
+        self._bind_style(self.prompt_count,
+                        lambda: f"color: {card_ink(c('bg'), 'fg')}; font-size: 11px;")
         foot.addWidget(self.prompt_count)
         self.prompt_state = QLabel("")
-        self.prompt_state.setStyleSheet(f"color: {c('muted')}; font-size: 11px;")
+        self.prompt_state.setStyleSheet(f"color: {card_ink(c('bg'), 'muted')}; font-size: 11px;")
         foot.addWidget(self.prompt_state)
         foot.addStretch()
         hint = QLabel(tr("chat.prompt_inject_hint"))
-        self._bind_style(hint, lambda: f"color: {c('dim')}; font-size: 11px;")
+        self._bind_style(hint, lambda: f"color: {card_ink(c('bg'), 'dim')}; font-size: 11px;")
         foot.addWidget(hint)
         box.addLayout(foot)
 
@@ -804,7 +808,7 @@ class ChatPage(QWidget):
 
     def _prompt_state_error(self, err: str):
         self.prompt_state.setText(tr("chat.prompt_save_fail").format(err=err))
-        self.prompt_state.setStyleSheet(f"color: {c('warn')}; font-size: 11px;")
+        self.prompt_state.setStyleSheet(f"color: {card_ink(c('bg'), 'warn')}; font-size: 11px;")
 
     def _apply_scope_from_conv(self):
         conv = self._current_conv()
@@ -849,13 +853,13 @@ class ChatPage(QWidget):
         )
         if not has:
             self.prompt_state.setText(tr("chat.prompt_state_none"))
-            self.prompt_state.setStyleSheet(f"color: {c('muted')}; font-size: 11px;")
+            self.prompt_state.setStyleSheet(f"color: {card_ink(c('bg'), 'muted')}; font-size: 11px;")
         elif mode == "global":
             self.prompt_state.setText(tr("chat.prompt_state_global"))
-            self.prompt_state.setStyleSheet(f"color: {c('green')}; font-size: 11px;")
+            self.prompt_state.setStyleSheet(f"color: {card_ink(c('bg'), 'green')}; font-size: 11px;")
         else:
             self.prompt_state.setText(tr("chat.prompt_state_conv"))
-            self.prompt_state.setStyleSheet(f"color: {c('muted')}; font-size: 11px;")
+            self.prompt_state.setStyleSheet(f"color: {card_ink(c('bg'), 'muted')}; font-size: 11px;")
 
         self.prompt_bar.setVisible(has)
         if has:
@@ -881,7 +885,7 @@ class ChatPage(QWidget):
     @staticmethod
     def _chip_btn_qss() -> str:
         return (
-            f"QPushButton {{ color: {c('muted')}; background: transparent;"
+            f"QPushButton {{ color: {canvas_ink('muted')}; background: transparent;"
             f" border: 1px solid {c('chip_border')}; border-radius: 12px;"
             " padding: 3px 12px; font-size: 12px; }"
             f" QPushButton:hover {{ color: {c('accent')}; background: {c('accent_soft')};"
@@ -891,7 +895,7 @@ class ChatPage(QWidget):
     @staticmethod
     def _model_combo_qss() -> str:
         return (
-            f"QComboBox#chatModelCombo {{ color: {c('fg')}; background: {c('surface')};"
+            f"QComboBox#chatModelCombo {{ color: {card_ink(c('surface'), 'fg')}; background: {c('surface')};"
             f" border: 1px solid {c('chip_border')}; border-radius: 12px;"
             " padding: 3px 10px; font-size: 12px; }"
             f" QComboBox#chatModelCombo:hover {{ border-color: {c('accent_border')}; }}"
@@ -905,7 +909,7 @@ class ChatPage(QWidget):
     @staticmethod
     def _icon_btn_qss() -> str:
         return (
-            f"QPushButton {{ color: {c('muted')}; background: transparent;"
+            f"QPushButton {{ color: {canvas_ink('muted')}; background: transparent;"
             f" border: 1px solid {c('chip_border')}; border-radius: 8px;"
             " padding: 0; min-height: 0; font-size: 14px; font-weight: 700; }"
             f" QPushButton:hover {{ color: {c('accent')}; background: {c('accent_soft')};"
@@ -913,9 +917,9 @@ class ChatPage(QWidget):
         )
 
     @staticmethod
-    def _mini_action_qss() -> str:
+    def _mini_action_qss(on: str) -> str:
         return (
-            f"QPushButton {{ color: {c('muted')}; background: transparent;"
+            f"QPushButton {{ color: {card_ink(on, 'muted')}; background: transparent;"
             " border: none; border-radius: 6px;"
             " padding: 2px 6px; min-height: 0; font-size: 11px; }"
             f" QPushButton:hover {{ color: {c('accent')}; background: {c('accent_soft')}; }}"
@@ -1034,15 +1038,18 @@ class ChatPage(QWidget):
         for attachment in self._attachments:
             chip = QFrame()
             chip.setObjectName("attachChip")
+            chip_fill = c('chip_bg')
             chip.setStyleSheet(
-                f"QFrame#attachChip {{ background: {c('chip_bg')};"
+                f"QFrame#attachChip {{ background: {chip_fill};"
                 f" border: 1px solid {c('chip_border')}; border-radius: 10px; }}"
             )
             chip_layout = QHBoxLayout(chip)
             chip_layout.setContentsMargins(8, 3, 4, 3)
             chip_layout.setSpacing(6)
             label = QLabel(attachment["name"])
-            label.setStyleSheet(f"color: {c('fg')}; font-size: 11px; border: none;")
+            label.setStyleSheet(
+                f"color: {card_ink(chip_fill, 'fg')}; font-size: 11px; border: none;"
+            )
             kind = attachment.get("kind", "text")
             size_mb = attachment.get("size", 0) / (1024 * 1024)
             tip = attachment["path"]
@@ -1059,7 +1066,7 @@ class ChatPage(QWidget):
             remove.setFixedSize(18, 18)
             remove.setCursor(Qt.PointingHandCursor)
             remove.setToolTip(tr("chat.delete"))
-            remove.setStyleSheet(self._mini_action_qss())
+            remove.setStyleSheet(self._mini_action_qss(c('chip_bg')))
             remove.clicked.connect(
                 lambda checked=False, a=attachment: self._remove_attachment(a)
             )
@@ -1152,10 +1159,10 @@ class ChatPage(QWidget):
         row_layout.setContentsMargins(2, 0, 0, 0)
         row_layout.setSpacing(2)
         row_layout.addWidget(self._icon_action(
-            copy_icon(c("muted"), 15), tr("chat.copy"),
+            copy_icon(canvas_ink("muted"), 15), tr("chat.copy"),
             lambda: self._copy_text(text)))
         row_layout.addWidget(self._icon_action(
-            download_icon(c("muted"), 15), tr("chat.save"),
+            download_icon(canvas_ink("muted"), 15), tr("chat.save"),
             lambda: self._save_text(text, suggested_name)))
         row_layout.addStretch()
         return row
@@ -1623,7 +1630,7 @@ class ChatPage(QWidget):
         content_layout.setSpacing(6)
         sender_label = QLabel(sender)
         sender_label.setStyleSheet(
-            f"color: {c('muted')}; font-size: 11px; font-weight: 600;"
+            f"color: {canvas_ink('muted')}; font-size: 11px; font-weight: 600;"
         )
         content_layout.addWidget(sender_label)
 
@@ -1658,7 +1665,7 @@ class ChatPage(QWidget):
         body.setWordWrap(True)
         body.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.LinksAccessibleByMouse)
         body.setStyleSheet(
-            f"QLabel {{ color: {c('fg')}; background: transparent; border: none;"
+            f"QLabel {{ color: {card_ink(bg, 'fg')}; background: transparent; border: none;"
             " font-size: 12px; }"
         )
         bubble_layout.addWidget(body)
@@ -1682,7 +1689,7 @@ class ChatPage(QWidget):
             stats = QLabel(footer)
             stats.setObjectName("messageStats")
             stats.setWordWrap(True)
-            stats.setStyleSheet(f"color: {c('muted')}; font-size: 10px;")
+            stats.setStyleSheet(f"color: {canvas_ink('muted')}; font-size: 10px;")
             content_layout.addWidget(stats)
         # No copy/download row on the user's own message: copying what you
         # just typed back out of the transcript is not an action anyone needs,
@@ -1720,7 +1727,7 @@ class ChatPage(QWidget):
             toggle.setFlat(True)
             toggle.setCursor(Qt.PointingHandCursor)
             toggle.setStyleSheet(
-                f"QPushButton {{ color: {c('muted')}; border: none; text-align: left;"
+                f"QPushButton {{ color: {card_ink(c('surface'), 'muted')}; border: none; text-align: left;"
                 " padding: 0; font-size: 11px; font-weight: 600; }"
             )
             toggle.clicked.connect(
@@ -1734,7 +1741,7 @@ class ChatPage(QWidget):
                 reasoning_text.setWordWrap(True)
                 reasoning_text.setTextInteractionFlags(Qt.TextSelectableByMouse)
                 reasoning_text.setStyleSheet(
-                    f"color: {c('muted')}; font-size: 11px; background: transparent;"
+                    f"color: {card_ink(c('surface'), 'muted')}; font-size: 11px; background: transparent;"
                     " border: none;"
                 )
                 reasoning_layout.addWidget(reasoning_text)
@@ -1746,7 +1753,7 @@ class ChatPage(QWidget):
             stats = QLabel(footer)
             stats.setObjectName("messageStats")
             stats.setWordWrap(True)
-            stats.setStyleSheet(f"color: {c('muted')}; font-size: 10px;")
+            stats.setStyleSheet(f"color: {canvas_ink('muted')}; font-size: 10px;")
             content_layout.addWidget(stats)
         content_layout.addWidget(
             self._message_action_row(text, self._suggest_filename(sender, text)),

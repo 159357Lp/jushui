@@ -9,13 +9,49 @@
 """
 
 from PySide6.QtCore import Qt, QSize
-from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
+from PySide6.QtGui import QColor, QImage, QImageReader, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QWidget
 
 from lmloader.gui import styles, ui_config
 
 _CACHE_LIMIT = 6
 _cache: dict[tuple[str, int, int, float], QPixmap] = {}
+_MEAN_LIMIT = 8
+_mean_cache: dict[str, str | None] = {}
+
+
+def average_colour(source: str) -> str | None:
+    """The picture's own average pixel as #RRGGBB, or None if it can't be read.
+
+    Decoded at 32×32 through ``QImageReader.setScaledSize`` so the whole
+    multi-megabyte file never lands in memory just to answer "is this painting
+    light or dark", and the answer is cached per path: every slider notch asks.
+    """
+    if source in _mean_cache:
+        return _mean_cache[source]
+
+    colour = None
+    reader = QImageReader(source)
+    reader.setAutoTransform(True)
+    size = reader.size()
+    if size.isValid():
+        reader.setScaledSize(QSize(32, 32))
+        image = reader.read()
+        if not image.isNull():
+            image = image.convertToFormat(QImage.Format_RGB32)
+            total = [0, 0, 0]
+            for y in range(image.height()):
+                for x in range(image.width()):
+                    p = image.pixelColor(x, y)
+                    total[0] += p.red()
+                    total[1] += p.green()
+                    total[2] += p.blue()
+            count = image.width() * image.height()
+            colour = "#{:02X}{:02X}{:02X}".format(*(round(v / count) for v in total))
+    if len(_mean_cache) >= _MEAN_LIMIT:
+        _mean_cache.pop(next(iter(_mean_cache)), None)
+    _mean_cache[source] = colour
+    return colour
 
 
 def cover_pixmap(source: str, size: QSize, dpr: float = 1.0) -> QPixmap:
