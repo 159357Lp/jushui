@@ -102,7 +102,7 @@ async def _refuse_decision_model(model_name: str, upstream_path: str) -> None:
     if record is None:
         return  # an alias we cannot resolve here; let the loader decide
     decision_type = str((record.metadata or {}).get("decision_type") or "")
-    if not decision_type and not engine_router.is_d3_package(record):
+    if not engine_router.is_decision_model(record):
         return
     label = f"Decision 3.0 决策模型（{decision_type}）" if decision_type else "Decision 3.0 决策模型"
     raise HTTPException(
@@ -237,6 +237,7 @@ async def create_system_one(request: Request):
 
 @router.get("/models")
 async def list_models():
+    from lmloader.engine.router import router as engine_router
     from lmloader.infra.database import db
 
     all_models = await db.list_models()
@@ -258,6 +259,11 @@ async def list_models():
                     "parameters": m.parameters,
                     "size": m.size,
                     "status": m.status,
+                    # Spelled out for every entry, never only for the ones it
+                    # matches: an OpenAI-only client has to be able to tell a
+                    # decision model (``/v1/systemone`` only) from a chat model
+                    # before offering it, and a missing key is not an answer.
+                    "is_decision_model": engine_router.is_decision_model(m),
                     **(
                         {
                             "port": loaded_map[m.name]["port"],

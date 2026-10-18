@@ -58,9 +58,12 @@ def is_decision_model(model: ModelRecord, engine_kind: str) -> bool:
     """True for either shape of decision model: a d3 package (kind "d3") or a
     decision-type GGUF. The GGUF variant resolves with kind "llama" (see
     router.resolve_engine), so its ``decision_type`` metadata is the only mark.
+
+    ``engine_kind`` is the caller's already-resolved shortcut; the record is
+    judged on its own so callers that never resolved an engine (the model list)
+    get the same answer from one implementation.
     """
-    return engine_kind == "d3" or bool(
-        (getattr(model, "metadata", None) or {}).get("decision_type"))
+    return engine_kind == "d3" or router.is_decision_model(model)
 
 
 class ModelInstance:

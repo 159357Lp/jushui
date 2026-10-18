@@ -752,7 +752,10 @@ class EngineRouter:
 
     def is_d3_package(self, model: ModelRecord) -> bool:
         """A Decision 3.0 package: its manifest schema plus its own server."""
-        p = Path(model.path)
+        path = getattr(model, "path", None)
+        if not path:
+            return False
+        p = Path(path)
         if not p.is_dir():
             return False
         if not (p / "d3_server.py").is_file():
@@ -765,6 +768,19 @@ class EngineRouter:
         except (OSError, ValueError):
             return False
         return isinstance(data, dict) and data.get("schema") == D3_MANIFEST_SCHEMA
+
+    def is_decision_model(self, model: ModelRecord) -> bool:
+        """Public: can this model answer only ``POST /v1/systemone``?
+
+        Two shapes qualify: a Decision 3.0 package (``kind == "d3"``) and a GGUF
+        carrying ``<arch>.decision.type``. Both have no chat template, so a
+        client that only speaks the OpenAI protocol must be able to tell them
+        apart from a chat model before it offers them in a picker — sampling one
+        through ``/v1/chat/completions`` yields letter soup, not an error.
+        """
+        if str((model.metadata or {}).get("decision_type") or ""):
+            return True
+        return self.is_d3_package(model)
 
     def d3_modalities(self, model: ModelRecord) -> list[str]:
         """Input kinds a Decision 3.0 package accepts, read off its files.

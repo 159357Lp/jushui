@@ -65,8 +65,7 @@ def _annotate_vision(d: dict, model) -> None:
     # A decision-type GGUF (``<arch>.decision.type``) is also not a chat model:
     # llama.cpp serves it on /v1/systemone only. Marked from the metadata the
     # parser already read, so nothing is guessed about its modalities.
-    d["is_decision_model"] = decision or bool(
-        (model.metadata or {}).get("decision_type"))
+    d["is_decision_model"] = engine_router.is_decision_model(model)
     if decision:
         d["modalities"] = engine_router.d3_modalities(model)
         d["has_vision"] = "image" in d["modalities"]

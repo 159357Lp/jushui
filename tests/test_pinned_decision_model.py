@@ -190,3 +190,99 @@ def test_watchdog_sweep_skips_pinned_source():
 
     src = inspect.getsource(LifecycleManager._idle_sweep_once)
     assert "inst.pinned" in src
+
+
+# ---------- OpenAI /v1/models 必须把决策模型标出来 ----------
+
+def _v1_models(records):
+    """Call the OpenAI list route against a fake DB."""
+    from unittest.mock import AsyncMock, patch
+
+    import lmloader.api.routes.chat as chat_routes
+
+    class FakeDB:
+        async def list_models(self, *a, **k):
+            return list(records)
+
+    class FakeLifecycle:
+        async def get_loaded_models(self):
+            return []
+
+    with patch.object(chat_routes, "lifecycle", FakeLifecycle()), \
+            patch("lmloader.infra.database.db", FakeDB()):
+        return asyncio.run(chat_routes.list_models())
+
+
+def _model(name, **kw):
+    rec = FakeRecord(name, metadata=kw.pop("metadata", {}))
+    for attr, default in (("architecture", "qwen35"), ("quantization", "Q4_K_M"),
+                          ("parameters", "4.8B"), ("size", 1), ("status", "unloaded"),
+                          ("created_at", None)):
+        setattr(rec, attr, kw.get(attr, default))
+    return rec
+
+
+def test_openai_model_list_marks_the_decision_gguf():
+    payload = _v1_models([
+        _model("chat.gguf"),
+        _model("d3-mini.gguf", metadata={"decision_type": "vllm-d3"}),
+    ])
+    by_id = {item["id"]: item["metadata"] for item in payload["data"]}
+    assert by_id["d3-mini.gguf"]["is_decision_model"] is True
+    # The negative control: an ordinary chat GGUF must be marked False, not
+    # left unlabelled, or a client cannot tell "not a chat model" from
+    # "server too old to know".
+    assert by_id["chat.gguf"]["is_decision_model"] is False
+
+
+def test_openai_model_list_marks_d3_package_by_files():
+    payload = _v1_models([_model("pkg")])
+    item = payload["data"][0]
+    assert item["metadata"]["is_decision_model"] is False, (
+        "a nonexistent path is not a d3 package; the flag must not guess"
+    )
+
+
+# ---------- /v1/chat/completions 的 400 拦截 ----------
+
+def _refuse(record):
+    from unittest.mock import patch
+
+    import lmloader.api.routes.chat as chat_routes
+
+    class FakeDB:
+        async def get_model_by_name(self, name):
+            return record
+
+    with patch("lmloader.infra.database.db", FakeDB()):
+        try:
+            asyncio.run(chat_routes._refuse_decision_model("m.gguf",
+                                                            "/v1/chat/completions"))
+        except chat_routes.HTTPException as exc:
+            return exc
+    return None
+
+
+def test_refusal_400_fires_for_decision_gguf():
+    exc = _refuse(_model("m.gguf", metadata={"decision_type": "vllm-d3"}))
+    assert exc is not None and exc.status_code == 400
+    assert "/v1/systemone" in str(exc.detail), "报错要把能用的端点说清楚"
+
+
+def test_refusal_skips_ordinary_chat_model():
+    # 反向对照：普通聊天模型必须畅通，否则这一拦就是把所有模型拦死
+    assert _refuse(_model("m.gguf")) is None
+
+
+def test_refusal_skips_unresolved_alias():
+    from unittest.mock import patch
+
+    import lmloader.api.routes.chat as chat_routes
+
+    class NoRecordDB:
+        async def get_model_by_name(self, name):
+            return None
+
+    with patch("lmloader.infra.database.db", NoRecordDB()):
+        assert asyncio.run(chat_routes._refuse_decision_model(
+            "alias", "/v1/chat/completions")) is None
