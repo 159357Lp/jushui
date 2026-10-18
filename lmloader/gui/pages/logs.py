@@ -14,7 +14,7 @@ from PySide6.QtGui import QGuiApplication, QFont, QTextCursor
 
 from lmloader.gui.api_client import LMLoaderAPI, run_in_thread
 from lmloader.gui.i18n import tr
-from lmloader.gui.styles import c
+from lmloader.gui.styles import c, tint
 from lmloader.gui.icons import eye_icon
 
 
@@ -42,13 +42,28 @@ def _source_color(source: str) -> str:
         return c("muted")
     return pair[0] if dark else pair[1]
 
-_ENDPOINTS = [
+_CHAT_ENDPOINTS = [
     ("GET", "/v1/models"),
     ("POST", "/v1/chat/completions"),
     ("POST", "/v1/completions"),
     ("POST", "/v1/embeddings"),
     ("POST", "/v1/responses"),
 ]
+# A decision model answers nothing on the chat endpoints: 掬水 refuses them with
+# a 400 on purpose (sampling it as chat yields letter soup, not an error). So it
+# gets its own one-line list instead of five URLs that cannot work.
+_DECISION_ENDPOINTS = [
+    ("POST", "/v1/systemone"),
+]
+
+
+def _endpoints_for(item: dict) -> list[tuple[str, str]]:
+    return _DECISION_ENDPOINTS if item.get("is_decision_model") else _CHAT_ENDPOINTS
+
+
+def _primary_path(item: dict) -> str:
+    """The one endpoint you would actually POST to for this model."""
+    return "/v1/systemone" if item.get("is_decision_model") else "/v1/chat/completions"
 
 
 def _fmt_gb(size_bytes: float) -> str:
@@ -264,6 +279,9 @@ class LogsPage(QWidget):
             empty.setStyleSheet(f"color: {c('muted')}; font-size: 12px;")
             self.loaded_box.addWidget(empty)
 
+            # The base address is valid with nothing loaded — clients configure
+            # it before the first model is up.
+            self.ep_box.addWidget(self._build_base_url_row())
             ep_empty = QLabel(tr("logs.endpoints_empty"))
             ep_empty.setStyleSheet(f"color: {c('dim')}; font-size: 12px;")
             self.ep_box.addWidget(ep_empty)
@@ -276,6 +294,7 @@ class LogsPage(QWidget):
         for item in loaded:
             self.loaded_box.addWidget(self._build_loaded_row(item))
 
+        self.ep_box.addWidget(self._build_base_url_row())
         for item in loaded:
             self.ep_box.addWidget(self._build_api_base_row(item))
             self.ep_box.addWidget(self._build_endpoint_row(item))
@@ -287,11 +306,35 @@ class LogsPage(QWidget):
         button.setEnabled(False)
         QTimer.singleShot(1200, lambda: (button.setText(old), button.setEnabled(True)))
 
-    def _build_api_base_row(self, item: dict) -> QFrame:
-        """Prominent API base URL — one click copies the whole base."""
-        port = item.get("port", "?")
-        base = f"http://127.0.0.1:{port}/v1"
+    def _build_base_url_row(self) -> QFrame:
+        """The address a client's "Base URL" box wants — no endpoint suffix.
 
+        This row exists because of a real mis-fill: a full call URL
+        (``…/v1/systemone``) got pasted into 织澜's Base URL field, that client
+        then appended its own ``/models`` and got a 404. The two addresses look
+        alike and do different jobs, so both are shown and labelled.
+        """
+        base = self.api.base_url.rstrip("/") + "/v1"
+        row = self._highlight_row()
+        lay = row.layout()
+
+        tag = QLabel(tr("logs.base_url"))
+        tag.setStyleSheet(f"color: {c('muted')}; font-size: 12px;")
+        lay.addWidget(tag, 0, Qt.AlignVCenter)
+
+        url = QLabel(base)
+        url.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        url.setToolTip(tr("logs.base_url_tip"))
+        url.setStyleSheet(
+            f"color: {c('title')}; font-size: 14px; font-weight: 700;"
+            "font-family: Consolas, monospace;"
+        )
+        lay.addWidget(url, 1, Qt.AlignVCenter)
+        self._wire_copy(row, base, lay)
+        return row
+
+    def _highlight_row(self) -> QFrame:
+        """A card-styled row the user can click anywhere to copy."""
         row = QFrame()
         row.setObjectName("apiBase")
         row.setCursor(Qt.PointingHandCursor)
@@ -304,27 +347,69 @@ class LogsPage(QWidget):
         lay = QHBoxLayout(row)
         lay.setContentsMargins(10, 6, 10, 6)
         lay.setSpacing(10)
+        return row
 
-        tag = QLabel(tr("logs.api_base"))
+    def _wire_copy(self, row: QFrame, payload: str, lay: QHBoxLayout) -> None:
+        """Add the copy button and make the whole row copy the same text."""
+        copy = QPushButton(tr("logs.copy"))
+        copy.setFixedWidth(60)
+        copy.clicked.connect(lambda checked=False, b=copy: self._copy_feedback(b, payload))
+        lay.addWidget(copy, 0, Qt.AlignVCenter)
+        row.mousePressEvent = lambda _ev=None, b=copy: self._copy_feedback(b, payload)
+
+    def _decision_badge(self) -> QLabel:
+        """The pill that says "this one is not a chat model"."""
+        badge = QLabel(tr("logs.decision_badge"))
+        badge.setToolTip(tr("logs.decision_badge_tip"))
+        badge.setStyleSheet(
+            f"color: {c('warn')}; background: {tint('warn', 0.16, 'surface_hover')};"
+            f" border: 1px solid {tint('warn', 0.4, 'surface_hover')};"
+            " border-radius: 8px; padding: 2px 8px;"
+            " font-size: 11px; font-weight: 700;"
+        )
+        return badge
+
+    def _build_api_base_row(self, item: dict) -> QFrame:
+        """The URL to actually call — one click copies model + endpoint.
+
+        It used to print the engine's own ``:port`` base, which is the raw
+        llama-server behind the proxy: copying it silently skips 掬水's JIT load,
+        the idle/pin rules and the decision-model refusal. The proxy base plus
+        the endpoint this model actually serves is what a caller needs; the
+        engine port stays visible, de-emphasised, for debugging.
+        """
+        port = item.get("port", "?")
+        path = _primary_path(item)
+        call_url = f"{self.api.base_url}{path}"
+
+        row = self._highlight_row()
+        lay = row.layout()
+
+        tag = QLabel(tr("logs.call_url"))
         tag.setStyleSheet(f"color: {c('muted')}; font-size: 12px;")
         lay.addWidget(tag, 0, Qt.AlignVCenter)
 
-        url = QLabel(base)
+        name = QLabel(str((item.get("model") or {}).get("name", "?")))
+        name.setStyleSheet(f"color: {c('title')}; font-size: 12px; font-weight: 600;")
+        lay.addWidget(name, 0, Qt.AlignVCenter)
+
+        if item.get("is_decision_model"):
+            lay.addWidget(self._decision_badge(), 0, Qt.AlignVCenter)
+
+        url = QLabel(call_url)
+        url.setTextInteractionFlags(Qt.TextSelectableByMouse)
         url.setStyleSheet(
-            f"color: {c('accent')}; font-size: 14px; font-weight: 700;"
+            f"color: {c('title')}; font-size: 14px; font-weight: 700;"
             "font-family: Consolas, monospace;"
         )
         lay.addWidget(url, 1, Qt.AlignVCenter)
 
-        copy = QPushButton(tr("logs.copy"))
-        copy.setFixedWidth(60)
-        copy.clicked.connect(lambda checked=False, b=base: self._copy_feedback(copy, b))
-        lay.addWidget(copy, 0, Qt.AlignVCenter)
+        direct = QLabel(tr("logs.engine_direct").format(port=port))
+        direct.setStyleSheet(f"color: {c('muted')}; font-size: 11px;")
+        direct.setToolTip(tr("logs.engine_direct_tip"))
+        lay.addWidget(direct, 0, Qt.AlignVCenter)
 
-        def _row_copy(_ev=None):
-            self._copy_feedback(copy, base)
-
-        row.mousePressEvent = _row_copy
+        self._wire_copy(row, call_url, lay)
         return row
 
     def _build_loaded_row(self, item: dict) -> QFrame:
@@ -351,6 +436,9 @@ class LogsPage(QWidget):
             "padding: 2px 8px; font-size: 11px; font-weight: 700;"
         )
         lay.addWidget(ready, 0, Qt.AlignVCenter)
+
+        if item.get("is_decision_model"):
+            lay.addWidget(self._decision_badge(), 0, Qt.AlignVCenter)
 
         name_lbl = QLabel(self._model_row_text(name, item.get("metrics")))
         name_lbl.setTextFormat(Qt.RichText)
@@ -407,8 +495,9 @@ class LogsPage(QWidget):
         )
 
     def _build_endpoint_row(self, item: dict) -> QFrame:
-        port = item.get("port", "?")
-        base = f"http://127.0.0.1:{port}"
+        # Same reason as the call URL above: these are addresses to paste into a
+        # client, so they go through the proxy, not the engine's private port.
+        base = self.api.base_url
         row = QFrame()
         row.setCursor(Qt.PointingHandCursor)
         row.setToolTip(tr("logs.click_to_copy"))
@@ -416,7 +505,7 @@ class LogsPage(QWidget):
         lay.setContentsMargins(10, 2, 10, 2)
         lay.setSpacing(10)
 
-        for method, path in _ENDPOINTS:
+        for method, path in _endpoints_for(item):
             m = QLabel(method)
             m.setFixedWidth(44)
             m.setStyleSheet(
@@ -432,7 +521,7 @@ class LogsPage(QWidget):
 
         copy = QPushButton(tr("logs.copy"))
         copy.setFixedWidth(52)
-        full = f"{base}{_ENDPOINTS[1][1]}"
+        full = f"{base}{_primary_path(item)}"
         copy.clicked.connect(lambda checked=False, b=full: self._copy_feedback(copy, b))
         lay.addWidget(copy, 0, Qt.AlignVCenter)
 

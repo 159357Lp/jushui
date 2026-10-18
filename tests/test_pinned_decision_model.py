@@ -166,6 +166,19 @@ def test_to_dict_exposes_pinned():
     assert inst2.to_dict()["pinned"] is False
 
 
+def test_to_dict_exposes_is_decision_model():
+    """/api/models/loaded 必须自带这个标记——GUI 拿它决定露哪个调用地址。"""
+    assert make_inst("d3-package", kind="d3").to_dict()["is_decision_model"] is True
+
+    gguf = ModelInstance(
+        FakeRecord("d3-mini.gguf", metadata={"decision_type": "vllm-d3"}),
+        FakeProcess(pid=908100), FakeLaunch(kind="llama"),
+    )
+    assert gguf.to_dict()["is_decision_model"] is True
+    # 反向对照：普通聊天模型不能也标 True，否则界面五个端点全被藏掉。
+    assert make_inst("chat.gguf").to_dict()["is_decision_model"] is False
+
+
 # ---------- 自动路径的接线守卫（源码级） ----------
 
 def test_load_model_gates_auto_paths():
@@ -286,3 +299,32 @@ def test_refusal_skips_unresolved_alias():
     with patch("lmloader.infra.database.db", NoRecordDB()):
         assert asyncio.run(chat_routes._refuse_decision_model(
             "alias", "/v1/chat/completions")) is None
+
+
+# ---------- 本地服务页：调用地址要跟着模型类型变 ----------
+
+def test_page_endpoints_follow_model_kind():
+    from lmloader.gui.pages import logs as logs_page
+
+    chat = {"is_decision_model": False}
+    decision = {"is_decision_model": True}
+    assert logs_page._primary_path(decision) == "/v1/systemone"
+    assert logs_page._primary_path(chat) == "/v1/chat/completions"
+    # 决策模型那一行只列它真能答的端点；列出五个 chat 端点等于邀请一次 400。
+    assert logs_page._endpoints_for(decision) == [("POST", "/v1/systemone")]
+    paths = [p for _, p in logs_page._endpoints_for(chat)]
+    assert "/v1/chat/completions" in paths and "/v1/systemone" not in paths
+
+
+def test_page_call_url_strings_exist_in_both_languages():
+    from lmloader.gui.i18n import TRANSLATIONS
+
+    keys = ("logs.call_url", "logs.engine_direct", "logs.engine_direct_tip",
+            "logs.base_url", "logs.base_url_tip",
+            "logs.decision_badge", "logs.decision_badge_tip")
+    for key in keys:
+        for lang in ("zh", "en"):
+            assert key in TRANSLATIONS[lang], f"{key} missing in {lang}"
+    # {port} 缺了会把花括号原样印在界面上。
+    for lang in ("zh", "en"):
+        assert "{port}" in TRANSLATIONS[lang]["logs.engine_direct"]

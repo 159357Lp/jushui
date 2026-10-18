@@ -134,6 +134,10 @@ class ModelInstance:
             "port": self.launch_config.port,
             "engine_slot": self.launch_config.engine_slot,
             "engine_kind": self.launch_config.kind,
+            # The GUI shows this row's call URL, and a decision model has no
+            # chat endpoint — read it off the same predicate the loader used to
+            # pin it, so the badge and the refusal can never disagree.
+            "is_decision_model": is_decision_model(self.model, self.launch_config.kind),
             "pinned": self.pinned,
             "system_one": self.system_one,
             "base_url": self.base_url,
