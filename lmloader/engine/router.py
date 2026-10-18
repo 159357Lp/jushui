@@ -69,7 +69,14 @@ def estimate_max_parallel(model, cfg: dict, vram_total_mb: Optional[int] = None)
     if not (hidden and layers and ctx):
         return MAX_PARALLEL
     bytes_per_val = CACHE_BYTES.get(str(cfg.get("cache_type_k", "q4_0")), 0.6)
-    kv_per_slot_gb = ctx * 2 * hidden * layers * bytes_per_val / (1024 ** 3)
+    # Same geometry the offload planner uses: counting KV as 2*hidden per layer
+    # assumes MHA on every layer, which for a hybrid GQA model inflates the
+    # per-slot cost enough to hide a dozen slots that genuinely fit.
+    from lmloader.engine import offload_planner
+    kv_elems = offload_planner.kv_elements_per_token(meta)
+    if kv_elems is None:
+        kv_elems = 2 * hidden * layers
+    kv_per_slot_gb = ctx * kv_elems * bytes_per_val / (1024 ** 3)
     if kv_per_slot_gb <= 0:
         return MAX_PARALLEL
     weights_gb = (size or 0) / (1024 ** 3)
@@ -431,6 +438,7 @@ class EngineRouter:
         ctx = cfg["ctx_size"]
         gpu = cfg["n_gpu_layers"]
         prewarm_flag = False
+        cpu_moe_layers = 0
         # Auto-tier (-1 sentinel): one-shot VRAM budget math at load time.
         # Free VRAM already includes every loaded model and the desktop, so
         # multi-model coexistence budgeting falls out of the measurement —
@@ -453,6 +461,7 @@ class EngineRouter:
             else:
                 gpu = plan.n_gpu_layers
                 prewarm_flag = plan.prewarm_suggested
+                cpu_moe_layers = plan.cpu_moe_layers
                 event_log.info(
                     "lifecycle", plan.reason, model=model.name,
                     ngl=plan.n_gpu_layers,
@@ -487,6 +496,8 @@ class EngineRouter:
         args += ["--port", str(port)]
         args += ["--host", defaults.host]
         args += ["--n-gpu-layers", str(gpu)]
+        if cpu_moe_layers > 0:
+            args += ["--n-cpu-moe", str(cpu_moe_layers)]
         args += ["-c", str(ctx)]
         args += ["--cache-type-k", cache_k]
         args += ["--cache-type-v", cache_v]

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lmloader.engine import offload_planner as op  # noqa: E402
+from lmloader.engine.hardware_costs import CostCoefficients  # noqa: E402
 from lmloader.engine.offload_planner import plan_offload  # noqa: E402
 from lmloader.engine.router import clamp_run_config  # noqa: E402
 
@@ -177,3 +178,183 @@ def test_router_resolves_sentinel():
     src = inspect.getsource(EngineRouter.build_launch_config)
     assert "gpu == -1" in src and "plan_for_model" in src
     assert "prewarm=prewarm_flag" in src
+
+
+# ---------- MoE 专家分层（数字取自 Qwen3-30B-A3B-Q4_K_M 头部实测） ----------
+
+MOE_SIZE = 18556685824          # 17697.6 MB
+MOE_EXPERT_BYTES = 17553162240  # 16739.9 MB，占权重 94.6%
+
+
+def make_moe_model(**over):
+    meta = {
+        "block_count": 48, "embedding_length": 2048, "context_length": 40960,
+        "vocab_size": 151669, "supports_mtp": False,
+        "expert_count": 128, "expert_used": 8,
+        "moe_layer_count": 48, "expert_bytes": MOE_EXPERT_BYTES,
+    }
+    meta.update(over)
+    return SimpleNamespace(
+        name="qwen3-30b-a3b.gguf", path="F:/models/qwen3-30b-a3b.gguf",
+        architecture="qwen3moe", size=MOE_SIZE, metadata=meta, backend=None,
+    )
+
+
+def _moe_gpu_usage_mb(p):
+    """显存账：非专家权重 + 满额 KV + 留在显存里的那些层的专家。"""
+    expert_total = p.avg_layer_mb * p.layers_total
+    dense = p.prewarm_mb - expert_total
+    keep = p.layers_total - p.cpu_moe_layers
+    return dense + p.kv_full_mb + keep * p.avg_layer_mb
+
+
+def test_moe_keeps_attention_and_offloads_expert_layers():
+    p = plan_offload(make_moe_model(), CFG, free_vram_mb=15360, free_ram_mb=65536)
+    assert p.n_gpu_layers == 999, "MoE 应让 -ngl 满驻留，靠 -ncmoe 省显存"
+    assert 0 < p.cpu_moe_layers < 48
+    assert _moe_gpu_usage_mb(p) <= p.budget_mb + 1.0, (
+        f"plan oversubscribes: {_moe_gpu_usage_mb(p)} > {p.budget_mb}")
+    assert "--n-cpu-moe" in p.reason and "MoE 专家分层" in p.reason
+
+
+def test_dense_model_never_gets_cpu_moe():
+    p = plan_offload(make_model(), CFG, free_vram_mb=15360, free_ram_mb=65536)
+    assert p.cpu_moe_layers == 0
+
+
+def test_moe_falls_back_to_layer_tiering_when_attention_cant_fit():
+    # 显存小到连注意力+KV 都放不下：-ncmoe 救不了，必须回通用解。
+    p = plan_offload(make_moe_model(), CFG, free_vram_mb=2048, free_ram_mb=65536)
+    assert p.cpu_moe_layers == 0
+    assert p.n_gpu_layers < 999
+
+
+def test_moe_offloads_every_expert_when_no_room_for_any():
+    # 预算刚好够注意力+KV，一层专家都放不下 → 48 层全下 CPU。
+    tight = CostCoefficients(vram_safety_fraction=0.99, base_overhead_mb=768.0,
+                             fallback_tail_fraction=0.12, max_tail_fraction=0.5,
+                             prewarm_ram_margin=1.25)
+    p = plan_offload(make_moe_model(), CFG, free_vram_mb=2800,
+                     free_ram_mb=65536, coefficients=tight)
+    assert p.cpu_moe_layers == 48
+    assert p.n_gpu_layers == 999
+
+
+def test_tighter_coefficients_offload_more_experts():
+    """反向对照：同一模型同一显存，更凶的系数必须让下 CPU 的专家层变多。
+
+    只会变绿的探针等于没测——这条守卫的是"系数表真的接进了 MoE 分支"。
+    """
+    loose = CostCoefficients(vram_safety_fraction=0.95, base_overhead_mb=100.0,
+                             fallback_tail_fraction=0.12, max_tail_fraction=0.5,
+                             prewarm_ram_margin=1.25)
+    tight = CostCoefficients(vram_safety_fraction=0.55, base_overhead_mb=3000.0,
+                             fallback_tail_fraction=0.12, max_tail_fraction=0.5,
+                             prewarm_ram_margin=1.25)
+    p_loose = plan_offload(make_moe_model(), CFG, free_vram_mb=15360,
+                           free_ram_mb=65536, coefficients=loose)
+    p_tight = plan_offload(make_moe_model(), CFG, free_vram_mb=15360,
+                           free_ram_mb=65536, coefficients=tight)
+    assert p_tight.cpu_moe_layers > p_loose.cpu_moe_layers, (
+        f"{p_tight.cpu_moe_layers} !> {p_loose.cpu_moe_layers}")
+    assert "系数来源" in p_loose.reason
+
+
+# ---------- KV 真实几何（数字取自本地 Qwen3.6-35B-A3B-MXFP4_MOE 头部实测） ----------
+#
+# 这里的常量不是编的：41 层、interval 4、2 个 KV 头、key/value 各 256，
+# 全部来自那个文件的 GGUF 头部；llama.cpp 自己在 -lv 4 里报出 ctx 65536
+# 时 CUDA0 KV buffer = 128 MiB，是这套几何的实测锚点（见 _pydiag 探针）。
+
+HYBRID_SIZE = 22182955008           # 21155 MB
+HYBRID_EXPERT_BYTES = 19451084800   # 18550 MB，占权重 87.7%
+
+
+def make_hybrid_model(**over):
+    meta = {
+        "block_count": 41, "embedding_length": 2048, "context_length": 262144,
+        "vocab_size": 496645, "supports_mtp": True,
+        "attention_head_count": 16, "attention_head_count_kv": 2,
+        "attention_key_length": 256, "attention_value_length": 256,
+        "full_attention_interval": 4,
+        "expert_count": 256, "expert_used": 8,
+        "moe_layer_count": 41, "expert_bytes": HYBRID_EXPERT_BYTES,
+    }
+    meta.update(over)
+    return SimpleNamespace(
+        name="qwen36-35b-a3b.gguf", path="M:/models/qwen36-35b-a3b.gguf",
+        architecture="qwen35moe", size=HYBRID_SIZE, metadata=meta, backend=None,
+    )
+
+
+def test_kv_elements_count_only_the_layers_that_hold_kv():
+    # 41 层里只有 (i+1)%4==0 的 10 层存 KV，MTP 附加层再 +1。
+    assert op.kv_elements_per_token(make_hybrid_model().metadata) == 11 * 2 * (256 + 256)
+
+
+def test_missing_geometry_returns_none_instead_of_guessing():
+    meta = dict(make_hybrid_model().metadata)
+    for k in ("attention_head_count_kv", "attention_key_length"):
+        meta.pop(k)
+    assert op.kv_elements_per_token(meta) is None
+
+
+def test_legacy_estimate_is_untouched_when_geometry_is_absent():
+    """没有几何字段时 KV 必须逐字节等于旧公式，保证这次改动不影响存量模型。"""
+    meta = {k: 0 for k in ("attention_head_count_kv", "attention_key_length",
+                           "attention_value_length", "full_attention_interval")}
+    p = plan_offload(make_hybrid_model(**meta), CFG, free_vram_mb=15360,
+                     free_ram_mb=65536)
+    # 2 × 2048 × 42 层 × 8192 token × 0.5625 字节
+    assert p.kv_full_mb == 756.0
+    assert "按 MHA 上限估计" in p.reason
+
+
+def test_hybrid_kv_no_longer_swamps_the_budget():
+    p = plan_offload(make_hybrid_model(), {**CFG, "ctx_size": 65536},
+                     free_vram_mb=15360, free_ram_mb=65536)
+    assert p.kv_full_mb < 400, (
+        f"真实几何下 KV 应远小于 400MB，实测 llama.cpp 只报 128MB：{p.kv_full_mb}")
+    assert "几何精算" in p.reason
+
+
+def test_accurate_kv_resides_more_experts():
+    """反向对照：把几何字段抹掉→KV 被高估→留在 CPU 的专家层必须变多。
+
+    守的是"KV 估算接进了卸载决策"，不是只接进了日志。
+    """
+    meta = dict(make_hybrid_model().metadata)
+    for k in ("attention_head_count_kv", "attention_key_length",
+              "attention_value_length"):
+        meta[k] = 0
+    cfg = {**CFG, "ctx_size": 65536}
+    exact = plan_offload(make_hybrid_model(), cfg, free_vram_mb=15360, free_ram_mb=65536)
+    legacy = plan_offload(make_hybrid_model(**meta), cfg, free_vram_mb=15360,
+                          free_ram_mb=65536)
+    assert exact.kv_full_mb < legacy.kv_full_mb
+    assert exact.cpu_moe_layers < legacy.cpu_moe_layers, (
+        f"{exact.cpu_moe_layers} !< {legacy.cpu_moe_layers}")
+    assert exact.n_gpu_layers == 999
+
+
+def test_estimate_max_parallel_stops_undercounting_hybrid_slots():
+    """同一张卡，KV 高估 16 倍就会把塞得下的 8 个并发槽报成 1。
+
+    权重压到 6GiB 是想单独测 KV 项：这个尺寸的模型才谈得上多槽，
+    20GiB 的模型在 16GB 卡上恒为 1 槽，改 KV 也看不出差别。
+    """
+    from lmloader.engine.router import estimate_max_parallel
+    cfg = {**CFG, "ctx_size": 65536}
+    small = int(6 * 1024 ** 3)
+    exact_model = make_hybrid_model()
+    exact_model.size = small
+    meta = dict(make_hybrid_model().metadata)
+    for k in ("attention_head_count_kv", "attention_key_length",
+              "attention_value_length"):
+        meta[k] = 0
+    legacy_model = make_hybrid_model(**meta)
+    legacy_model.size = small
+    exact = estimate_max_parallel(exact_model, cfg, vram_total_mb=15999)
+    legacy = estimate_max_parallel(legacy_model, cfg, vram_total_mb=15999)
+    assert legacy == 1, f"旧公式应触底到 1 槽：{legacy}"
+    assert exact == 8, f"真实几何应放行到并发上限：{exact}"

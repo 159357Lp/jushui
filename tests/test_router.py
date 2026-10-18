@@ -260,3 +260,27 @@ def test_d3_modalities_from_manifest_package(router, tmp_path):
 def test_d3_modalities_without_shard_index(router, tmp_path):
     model = _d3_pkg(tmp_path, index=False)
     assert router.d3_modalities(model) == ["text", "image", "video"]
+
+
+def _auto_tier_plan(cpu_moe_layers):
+    from lmloader.engine.offload_planner import OffloadPlan
+    return OffloadPlan(
+        n_gpu_layers=999, layers_total=48, free_vram_mb=15360, budget_mb=12288,
+        tail_reserve_mb=0, kv_full_mb=900, avg_layer_mb=349,
+        layers_on_disk=cpu_moe_layers, prewarm_suggested=False,
+        prewarm_mb=17697, reason="测试用规划", cpu_moe_layers=cpu_moe_layers)
+
+
+@pytest.mark.parametrize("cpu_moe,expect", [(20, True), (0, False)])
+def test_auto_tier_wires_the_cpu_moe_flag(router, monkeypatch, cpu_moe, expect):
+    """规划结果必须真的变成启动参数：-ncmoe 只在 MoE 分支给层数时才出现。"""
+    from lmloader.engine import offload_planner
+    monkeypatch.setattr(router, "resolve_engine", lambda m: ("primary", "llama"))
+    monkeypatch.setattr(offload_planner, "plan_for_model",
+                        lambda m, c: _auto_tier_plan(cpu_moe))
+    model = _make_record("Qwen3-30B-A3B-Q4_K_M.gguf", "qwen3moe")
+    args = router.build_launch_config(
+        model, 8177, run_config={"n_gpu_layers": -1}).args
+    assert ("--n-cpu-moe" in args) is expect
+    if expect:
+        assert args[args.index("--n-cpu-moe") + 1] == "20"
