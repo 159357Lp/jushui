@@ -473,6 +473,14 @@ class LifecycleManager:
         self._used_ports: set[int] = set()
         self._lock = asyncio.Lock()
         self._idle_task: Optional[asyncio.Task] = None
+        # 共存账本的三枚内部状态：busy 防止让位重载递归回到本账本；
+        # tier 是一次性的 --n-cpu-moe 额度（按联合解给新加载的模型），
+        # 只活在内存里——写进 DB 会让一次加载的副作用留在用户配置上；
+        # authored 记下"这一档是账本代笔写回的"，下次联合解才能把它当自动档
+        # 重新压（否则让步只能做一次，第二次就把手填顶穿却报可行）。
+        self._coexistence_busy = False
+        self._coexistence_tier: dict[str, int] = {}
+        self._coexistence_authored: dict[str, tuple[str, int]] = {}
 
     async def start_watchdog(self):
         """Start the idle-unload watchdog and reap leftover engine processes.
@@ -567,6 +575,129 @@ class LifecycleManager:
                     except Exception as e:  # noqa: BLE001
                         logger.error(f"idle unload failed for {name}: {e}")
 
+    async def _measured_vram_mb(self, name: str) -> Optional[float]:
+        """Engine-self-reported on-card MiB, or None until it has printed any."""
+        instance = self.instances.get(name)
+        if not instance:
+            return None
+        breakdown = instance.memory_breakdown() or {}
+        return (breakdown.get("total_mib") or {}).get("vram") or None
+
+    def _vision_mb(self, path: Optional[str]) -> float:
+        """Mounted vision encoder's on-card MiB — the engine never reports it.
+
+        llama.cpp prints a worst-case estimate (892MiB for a 644MiB d3 file) but
+        only after the engine is up; the file size is the number available while
+        still deciding, and the CUDA context allowance covers the gap.
+        """
+        if not path:
+            return 0.0
+        try:
+            return Path(path).stat().st_size / 1048576.0
+        except OSError:
+            return 0.0
+
+    async def _make_room_for(self, model: ModelRecord) -> None:
+        """Settle every resident engine under the card's non-paging ceiling.
+
+        nvidia-smi's *free* only stops the next load from overflowing; it never
+        pushes the incumbent down, so a pair can sit jointly inside WDDM paging
+        where all engines decay together. This runs the joint ledger and
+        reloads whichever incumbent must yield. Pinned decision models and
+        non-MoE models are rigid — only a MoE has an elastic tier to give up.
+
+        Deliberately outside self._lock: yielding reloads take the same lock,
+        and the one-shot tier it records is read back by the load below.
+        """
+        if self._coexistence_busy or not self.instances:
+            return
+        if model.name in self.instances:
+            return
+        self._coexistence_busy = True
+        try:
+            from lmloader.engine import offload_planner
+
+            entries = []
+            for name, instance in list(self.instances.items()):
+                cfg = await _get_run_config_sync(name) or {}
+                key, value = self._coexistence_authored.get(name, (None, None))
+                hand = cfg.get(key) if key is not None else None
+                if key is not None and hand is not None and int(hand) == value:
+                    # 这一档是本账本上一次代笔写回的，不是他手填的：按自动档
+                    # 重新联合解算，否则让步只能做一次，第二次就被自己钉死。
+                    cfg = {**cfg, key: -1}
+                entries.append({
+                    "model": instance.model,
+                    "cfg": cfg,
+                    "pinned": bool(instance.pinned),
+                    "resident_mb": await self._measured_vram_mb(name),
+                    "vision_mb": self._vision_mb(instance.launch_config.mmproj_path),
+                })
+            entries.append({
+                "model": model,
+                "cfg": await _get_run_config_sync(model.name) or {},
+                # 新来的这只若是决策模型要算 rigid；d3 包一定是 dense，
+                # 所以这里只看 GGUF 的 decision_type 就够（不必先探测引擎）。
+                "pinned": bool(router.is_decision_model(model)),
+                "resident_mb": None,
+                # 按"会挂视觉"预扣：真挂了才准，纯文本请求则多留了一小块，
+                # 方向是保守的——宁可少塞一点都不让整卡进分页区。
+                "vision_mb": self._vision_mb(router.find_mmproj(model)),
+            })
+            probe = await asyncio.to_thread(
+                offload_planner.plan_coexistence_for_models, entries)
+            if probe is None:
+                return
+            if not probe.feasible:
+                # 只报账不拦门：拒绝加载会让"看看能不能塞下"变成一次失败，
+                # 而越界真正付出的代价是掉速，不是崩。
+                event_log.warning("coexist", probe.reason, model=model.name)
+                return
+            event_log.info("coexist", probe.reason, model=model.name)
+
+            newcomer = probe.plans.get(model.name)
+            if newcomer and newcomer.cpu_moe_layers:
+                self._coexistence_tier[model.name] = newcomer.cpu_moe_layers
+
+            for name in probe.reload_names:
+                instance = self.instances.get(name)
+                plan = probe.plans.get(name)
+                if not instance or not plan:
+                    continue
+                resident = await self._measured_vram_mb(name)
+                target = probe.footprints.get(name) or plan.predicted_vram_mb
+                saved = await _get_run_config_sync(name) or {}
+                if plan.cpu_moe_layers:
+                    saved["cpu_moe_layers"] = plan.cpu_moe_layers
+                    move = f"--n-cpu-moe {plan.cpu_moe_layers}"
+                    self._coexistence_authored[name] = ("cpu_moe_layers",
+                                                        plan.cpu_moe_layers)
+                else:
+                    saved["n_gpu_layers"] = plan.n_gpu_layers
+                    move = f"-ngl {plan.n_gpu_layers}"
+                    self._coexistence_authored[name] = ("n_gpu_layers",
+                                                        plan.n_gpu_layers)
+                await db.save_run_config(name, saved)
+                event_log.info(
+                    "coexist",
+                    f"为 {model.name} 让位：{name} 常驻 {resident:.0f}MB → 约 "
+                    f"{target:.0f}MB（改为 {move}），正在重载，期间该模型的请求会中断",
+                    model=name,
+                )
+                if not await self.unload_model(name):
+                    event_log.warning(
+                        "coexist", f"{name} 卸载失败，让位中止，本次按现状共存",
+                        model=name)
+                    continue
+                if not await self.load_model(instance.model, keep_previous=True):
+                    event_log.error(
+                        "coexist", f"{name} 让位后重载失败，请手动检查", model=name)
+        except Exception as e:  # noqa: BLE001
+            # 共存账本失灵绝不能拖垮一次加载：退回原有语义，只留一行日志。
+            logger.warning(f"coexistence planning failed for {model.name}: {e}")
+        finally:
+            self._coexistence_busy = False
+
     async def load_model(
         self,
         model: ModelRecord,
@@ -580,6 +711,7 @@ class LifecycleManager:
           True -> force mounting a vision encoder (if found);
           False -> load WITHOUT a vision encoder (text-only).
         """
+        await self._make_room_for(model)
         async with self._lock:
             if model.name in self.instances:
                 logger.warning(f"Model already loaded: {model.name}")
@@ -655,6 +787,16 @@ class LifecycleManager:
             mmproj_path = "" if vision_enabled is False else None
             try:
                 run_config = await _get_run_config_sync(model.name)
+                # 共存账本给这只模型定过档：一次性覆盖，绝不写回它的配置。
+                joint_tier = self._coexistence_tier.pop(model.name, None)
+                if joint_tier is not None:
+                    run_config = {**(run_config or {}), "cpu_moe_layers": joint_tier}
+                    event_log.info(
+                        "coexist",
+                        f"{model.name} 按共存账本加载：--n-cpu-moe {joint_tier}"
+                        f"（一次性，不改你的运行配置）",
+                        model=model.name,
+                    )
                 launch_config = router.build_launch_config(
                     model, port, mmproj_path=mmproj_path, run_config=run_config,
                 )

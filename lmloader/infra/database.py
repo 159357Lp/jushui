@@ -94,6 +94,7 @@ class Database:
                     ubatch_size INTEGER NOT NULL DEFAULT 512,
                     mtp_enabled INTEGER NOT NULL DEFAULT 1,
                     spec_draft_max INTEGER NOT NULL DEFAULT 1,
+                    cpu_moe_layers INTEGER NOT NULL DEFAULT -1,
                     updated_at TEXT NOT NULL
                 )
             """)
@@ -105,6 +106,8 @@ class Database:
                 "ubatch_size": "INTEGER NOT NULL DEFAULT 512",
                 "mtp_enabled": "INTEGER NOT NULL DEFAULT 1",
                 "spec_draft_max": "INTEGER NOT NULL DEFAULT 1",
+                # -1 = 自动分层解出来的档；N >= 0 = 手填的 --n-cpu-moe。
+                "cpu_moe_layers": "INTEGER NOT NULL DEFAULT -1",
             }
             for col, decl in migrations.items():
                 if col not in existing_cols:
@@ -244,6 +247,7 @@ class Database:
                 "ubatch_size": row["ubatch_size"],
                 "mtp_enabled": bool(row["mtp_enabled"]),
                 "spec_draft_max": row["spec_draft_max"],
+                "cpu_moe_layers": row["cpu_moe_layers"],
             }
 
     async def save_run_config(self, model_name: str, cfg: dict) -> dict:
@@ -254,8 +258,9 @@ class Database:
                 INSERT OR REPLACE INTO model_run_configs
                 (model_name, ctx_size, n_gpu_layers, threads, flash_attn,
                  cache_type_k, cache_type_v, parallel,
-                 batch_size, ubatch_size, mtp_enabled, spec_draft_max, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 batch_size, ubatch_size, mtp_enabled, spec_draft_max,
+                 cpu_moe_layers, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     model_name,
@@ -270,6 +275,7 @@ class Database:
                     cfg.get("ubatch_size", 512),
                     1 if cfg.get("mtp_enabled", True) else 0,
                     cfg.get("spec_draft_max", 1),
+                    cfg.get("cpu_moe_layers", -1),
                     now,
                 ),
             )

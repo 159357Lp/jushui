@@ -233,7 +233,8 @@ def test_moe_offloads_every_expert_when_no_room_for_any():
     # 预算刚好够注意力+KV，一层专家都放不下 → 48 层全下 CPU。
     tight = CostCoefficients(vram_safety_fraction=0.99, base_overhead_mb=768.0,
                              fallback_tail_fraction=0.12, max_tail_fraction=0.5,
-                             prewarm_ram_margin=1.25)
+                             prewarm_ram_margin=1.25,
+                             paging_ceiling_fraction=0.80)
     p = plan_offload(make_moe_model(), CFG, free_vram_mb=2800,
                      free_ram_mb=65536, coefficients=tight)
     assert p.cpu_moe_layers == 48
@@ -247,10 +248,12 @@ def test_tighter_coefficients_offload_more_experts():
     """
     loose = CostCoefficients(vram_safety_fraction=0.95, base_overhead_mb=100.0,
                              fallback_tail_fraction=0.12, max_tail_fraction=0.5,
-                             prewarm_ram_margin=1.25)
+                             prewarm_ram_margin=1.25,
+                             paging_ceiling_fraction=0.80)
     tight = CostCoefficients(vram_safety_fraction=0.55, base_overhead_mb=3000.0,
                              fallback_tail_fraction=0.12, max_tail_fraction=0.5,
-                             prewarm_ram_margin=1.25)
+                             prewarm_ram_margin=1.25,
+                             paging_ceiling_fraction=0.80)
     p_loose = plan_offload(make_moe_model(), CFG, free_vram_mb=15360,
                            free_ram_mb=65536, coefficients=loose)
     p_tight = plan_offload(make_moe_model(), CFG, free_vram_mb=15360,

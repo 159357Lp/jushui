@@ -1,8 +1,10 @@
 """把 cal_results.json 的扫描曲线拟合成本卡实测行，并自证它选得出快档。
 
-拟合的就是两个可测系数：
+拟合的可测系数：
   base_overhead_mb    ← 引擎 -lv 4 自报的 CUDA0 compute + recurrent 缓冲
   vram_safety_fraction ← 拐点显存权重 + KV + 上述开销，再除以当时的空闲显存
+  paging_ceiling_fraction ← 同一合计峰值 ÷ 物理显存总量（共存账本的整卡上限）
+  engine_context_mb   ← 卡上真实占用 − 桌面底噪 − 引擎自报合计，逐档取最大值
 
 重尾/预热三个系数与显卡无关（是文件结构和 RAM 策略），保留通用值，
 provenance 里写清楚哪些是实测、哪些是沿用。
@@ -85,12 +87,30 @@ def fit(rows):
     free_before_load = star["free_before_mib"]
     desktop_baseline = subprocess_total() - free_before_load
     safety = engine_total / free_before_load
+    # 整卡常驻总量的上限：驱动分页是全局性质，多引擎加起来一起撞，
+    # 单模型的 safety 打折拦不住"两只各留 20% 余量、合起来超了"。
+    ceiling = engine_total / (desktop_baseline + free_before_load)
+    # 每进程 CUDA 上下文：卡上真实占用 − 桌面底噪 − 引擎自报合计，剩下的就是
+    # 自报口径量不到的那份。取各档最大值（保守方向：宁可多留）。
+    contexts = []
+    card_total = subprocess_total()
+    for r in healthy:
+        rb = buffers(r["ncmoe"])
+        if not rb or not r.get("gpu_used_mib"):
+            continue
+        used_before = card_total - r["free_before_mib"]
+        self_reported = r["vram_weights_mib"] + rb["kv"] + rb["compute"] + rb["recurrent"]
+        contexts.append(round(r["gpu_used_mib"] - used_before - self_reported, 1))
+    if not contexts:
+        raise SystemExit("RED: 没有一档能反解进程上下文，engine_context_mb 无从实测")
     return {
         "peak_tps": peak, "star": star, "plateau": plateau or healthy,
         "healthy": healthy, "thrash": thrash,
         "overhead_mb": overhead, "buffers": b, "engine_total": engine_total,
         "used_before": desktop_baseline, "free_before_load": free_before_load,
-        "safety": safety, "dropped": len(rows) - len(usable),
+        "safety": safety, "ceiling": ceiling,
+        "context_mb": max(contexts), "context_rows": contexts,
+        "dropped": len(rows) - len(usable),
     }
 
 
@@ -112,7 +132,9 @@ def main():
           f"缓冲 {f['buffers']}")
     print(f"桌面底噪 {f['used_before']:.0f} MiB → 规划可见空闲 {f['free_before_load']:.0f} MiB"
           f"（引擎合计 {f['engine_total']:.0f}）→ 拟合 safety={f['safety']:.4f} "
-          f"overhead={f['overhead_mb']:.0f}MB")
+          f"overhead={f['overhead_mb']:.0f}MB 整卡上限={f['ceiling']:.4f}")
+    print(f"逐档反解的进程外显存 {f['context_rows']} MiB → engine_context_mb"
+          f"={f['context_mb']:.0f}（取最大，保守）")
 
     cls = detect_hardware_class()
     print(f"hardware_class = {cls}（现用来源：{resolve_coefficients().source}）")
@@ -121,6 +143,8 @@ def main():
         coeffs = dict(GENERIC_COEFFICIENTS)
         coeffs["vram_safety_fraction"] = round(f["safety"], 4)
         coeffs["base_overhead_mb"] = round(f["overhead_mb"], 1)
+        coeffs["paging_ceiling_fraction"] = round(f["ceiling"], 4)
+        coeffs["engine_context_mb"] = round(f["context_mb"], 1)
         save_measurement(cls, coeffs, {
             "measured_at": "2026-10-19",
             "method": "_pydiag/calibrate_5080.py 同模型同参数只变 --n-cpu-moe，"
@@ -129,9 +153,14 @@ def main():
             "peak_tps": f["peak_tps"],
             "knee_ncmoe": f["star"]["ncmoe"],
             "knee_vram_weights_mib": f["star"]["vram_weights_mib"],
-            "measured_fields": ["vram_safety_fraction", "base_overhead_mb"],
+            "measured_fields": ["vram_safety_fraction", "base_overhead_mb",
+                                "paging_ceiling_fraction", "engine_context_mb"],
             "inherited_fields": ["fallback_tail_fraction", "max_tail_fraction",
                                  "prewarm_ram_margin"],
+            "paging_ceiling_basis": "拐点档引擎合计峰值 ÷ 物理显存总量（常驻总量是全局性质，多引擎一起撞）",
+            "engine_context_basis": "逐档 (卡上占用 − 桌面底噪 − 引擎自报合计) 取最大值；"
+                                    "共存账本要逐进程计一次，单模型时被 safety 折扣吸收",
+            "engine_context_rows_mib": f["context_rows"],
             "free_vram_before_load_mib": f["free_before_load"],
             "desktop_baseline_mib": f["used_before"],
         })

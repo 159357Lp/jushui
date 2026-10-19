@@ -125,6 +125,16 @@ def clamp_run_config(model, cfg: dict) -> dict:
     gpu = int(out.get("n_gpu_layers") or 0)
     out["n_gpu_layers"] = gpu if gpu == -1 else min(max(gpu, 0), 999)
 
+    # --n-cpu-moe 的可动范围是该模型的 MoE 层数：超过它就等于把专家全下 CPU，
+    # 是一个不会存在的假档；-1 保持原样，交给自动分层解算。
+    moe_layers = int(meta.get("moe_layer_count") or 0)
+    try:
+        ncmoe = int(out.get("cpu_moe_layers", -1))
+    except (TypeError, ValueError):
+        ncmoe = -1
+    out["cpu_moe_layers"] = ncmoe if ncmoe < 0 else (
+        min(ncmoe, moe_layers) if moe_layers else 0)
+
     out["threads"] = min(max(int(out.get("threads") or 1), 1), cpu)
     out["parallel"] = min(max(int(out.get("parallel") or 1), 1), MAX_PARALLEL)
 
@@ -432,6 +442,8 @@ class EngineRouter:
             "mtp_enabled": _pick("mtp_enabled", getattr(defaults, "mtp_enabled", True)),
             "spec_draft_max": _pick("spec_draft_max", getattr(defaults, "spec_draft_max", 2)),
             "reasoning_budget": _pick("reasoning_budget", getattr(defaults, "reasoning_budget", -1)),
+            # -1 = 交给自动分层解算；N = 手填的 --n-cpu-moe（共存让步的把手）
+            "cpu_moe_layers": _pick("cpu_moe_layers", -1),
         }
         cfg = clamp_run_config(model, cfg_in)
 
@@ -440,9 +452,10 @@ class EngineRouter:
         prewarm_flag = False
         cpu_moe_layers = 0
         # Auto-tier (-1 sentinel): one-shot VRAM budget math at load time.
-        # Free VRAM already includes every loaded model and the desktop, so
-        # multi-model coexistence budgeting falls out of the measurement —
-        # no per-model accounting to drift out of date.
+        # Free VRAM already includes every loaded model and the desktop, so a
+        # single load can't overflow the card — but it never rebalances the
+        # incumbent either, so multi-model residency is settled by
+        # offload_planner.plan_coexistence at load time in lifecycle.
         if gpu == -1:
             from lmloader.engine import offload_planner
             plan = None
@@ -466,6 +479,17 @@ class EngineRouter:
                     "lifecycle", plan.reason, model=model.name,
                     ngl=plan.n_gpu_layers,
                 )
+        manual_moe = int(cfg.get("cpu_moe_layers", -1) or -1)
+        if cpu_moe_layers == 0 and manual_moe > 0:
+            # 手填 -ngl（非自动分层）时也允许手填 --n-cpu-moe：MoE 的弹性档
+            # 与整层卸载是两个独立的旋钮，共存让步往往只动后者。
+            cpu_moe_layers = manual_moe
+            event_log.info(
+                "lifecycle",
+                f"模型 {model.name} 手填 --n-cpu-moe {manual_moe}"
+                f"（-ngl {gpu} 保持手动语义，未经自动分层解算）",
+                model=model.name,
+            )
         threads = cfg["threads"]
         flash = cfg["flash_attn"]
         cache_k = cfg["cache_type_k"]

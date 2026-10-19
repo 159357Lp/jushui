@@ -108,14 +108,14 @@ def test_duplicate_hardware_class_raises(tmp_path):
         hc.load_table(str(bad))
 
 
-def test_missing_or_unknown_coefficient_raises(tmp_path):
+def test_unknown_or_inconsistent_coefficient_raises(tmp_path):
     bad = tmp_path / "costs.json"
     for name, coefficients in (
-        ("缺项", {k: v for k, v in hc.GENERIC_COEFFICIENTS.items()
-                  if k != "base_overhead_mb"}),
         ("多项", {**hc.GENERIC_COEFFICIENTS, "made_up": 1.0}),
         ("比例倒挂", {**hc.GENERIC_COEFFICIENTS, "fallback_tail_fraction": 0.9,
                      "max_tail_fraction": 0.5}),
+        ("上限越界", {**hc.GENERIC_COEFFICIENTS, "paging_ceiling_fraction": 1.4}),
+        ("非数值", {**hc.GENERIC_COEFFICIENTS, "base_overhead_mb": "很大"}),
     ):
         bad.write_text(json.dumps({"version": 1, "machines": [
             {"hardware_class": "nvidia-x-sm120", "coefficients": coefficients}]}),
@@ -125,6 +125,27 @@ def test_missing_or_unknown_coefficient_raises(tmp_path):
         except hc.HardwareCostError:
             continue
         pytest.fail(f"{name} 的表没有被拒绝")
+
+
+def test_row_written_before_a_new_field_inherits_it(tmp_path, caplog):
+    """早于某项系数写下的行，缺的键按通用值继承并留警告，不作废整张表。
+
+    反向对照：若这里改成抛错，router 的 except 会把自动分层整体回退成
+    -ngl 999 全量卸载——比继续用实测的其余系数更糟。所以既断言继承值，
+    也断言警告落地（事后能从日志判断这笔账是不是又靠了兜底）。
+    """
+    row = {k: v for k, v in hc.GENERIC_COEFFICIENTS.items()
+           if k != "base_overhead_mb"}
+    row["vram_safety_fraction"] = 0.55
+    bad = tmp_path / "costs.json"
+    bad.write_text(json.dumps({"version": 1, "machines": [
+        {"hardware_class": "nvidia-x-sm120", "coefficients": row}]}), encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        table = hc.load_table(str(bad))
+    assert table["nvidia-x-sm120"]["vram_safety_fraction"] == 0.55
+    assert (table["nvidia-x-sm120"]["base_overhead_mb"]
+            == hc.GENERIC_COEFFICIENTS["base_overhead_mb"])
+    assert "缺少系数" in caplog.text, caplog.text
 
 
 def test_generic_key_is_reserved(tmp_path):
@@ -141,10 +162,12 @@ def test_tighter_coefficients_actually_lower_ngl():
     model = make_model()
     loose = hc.CostCoefficients(vram_safety_fraction=0.95, base_overhead_mb=100.0,
                                 fallback_tail_fraction=0.12, max_tail_fraction=0.5,
-                                prewarm_ram_margin=1.25)
+                                prewarm_ram_margin=1.25,
+                             paging_ceiling_fraction=0.80)
     tight = hc.CostCoefficients(vram_safety_fraction=0.60, base_overhead_mb=4000.0,
                                 fallback_tail_fraction=0.12, max_tail_fraction=0.5,
-                                prewarm_ram_margin=1.25)
+                                prewarm_ram_margin=1.25,
+                             paging_ceiling_fraction=0.80)
     plan_loose = plan_offload(model, CFG, 12000.0, 65536.0, coefficients=loose)
     plan_tight = plan_offload(model, CFG, 12000.0, 65536.0, coefficients=tight)
     assert plan_loose.n_gpu_layers > plan_tight.n_gpu_layers

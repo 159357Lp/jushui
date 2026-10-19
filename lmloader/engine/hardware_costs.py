@@ -36,6 +36,13 @@ TABLE_VERSION = 1
 #     超了说明估算失真。
 #   prewarm_ram_margin: 预热页缓存的 RAM 门槛，模型要放得进空闲内存且留 25%
 #     余量，否则宁可让首推理慢慢缺页，也不把系统推进交换区。
+#   paging_ceiling_fraction: 整卡常驻总量的上限，按显存**总量**折算。这是驱动
+#     层面的全局性质，与单模型预算的 vram_safety_fraction 不是一回事：后者管
+#     "这一次加载留多少余量"，前者管"几张引擎加起来能不能不分页"。多模型共存
+#     只有后者会漏算桌面底噪与其他引擎的缓冲，WDDM 一旦开始分页是全体一起掉速。
+#   engine_context_mb: 每个引擎进程自身在 `-lv 4` 自报之外的显存占用（CUDA 上下文
+#     与框架预留）。自报口径量不到它，单模型时被 vram_safety_fraction 的折扣吸收，
+#     多模型加起来就必须逐进程计一次，否则 N 只引擎的账比卡上真实占用少 N 份。
 GENERIC_HARDWARE_CLASS = "generic"
 GENERIC_COEFFICIENTS = {
     "vram_safety_fraction": 0.85,
@@ -43,6 +50,8 @@ GENERIC_COEFFICIENTS = {
     "fallback_tail_fraction": 0.12,
     "max_tail_fraction": 0.5,
     "prewarm_ram_margin": 1.25,
+    "paging_ceiling_fraction": 0.80,
+    "engine_context_mb": 256.0,
 }
 
 
@@ -79,6 +88,10 @@ class CostCoefficients:
     fallback_tail_fraction: float
     max_tail_fraction: float
     prewarm_ram_margin: float
+    paging_ceiling_fraction: float
+    # 引擎进程自身的 CUDA 上下文，自报口径看不见；带默认值，早于它写下的实测行
+    # 仍能被读出（load_table 会按通用值补齐）。
+    engine_context_mb: float = 256.0
     # 哪张表算出来的账必须跟着进日志，否则事后无从判断是不是又用了兜底值。
     source: str = GENERIC_HARDWARE_CLASS
 
@@ -96,14 +109,24 @@ def _validate(coefficients: dict, context: str) -> dict:
     checked = {}
     for key, floor in (("vram_safety_fraction", 0.0), ("fallback_tail_fraction", 0.0),
                        ("max_tail_fraction", 0.0), ("prewarm_ram_margin", 1.0),
-                       ("base_overhead_mb", 0.0)):
+                       ("base_overhead_mb", 0.0), ("paging_ceiling_fraction", 0.0),
+                       ("engine_context_mb", 0.0)):
         value = coefficients[key]
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise HardwareCostError(f"{context}.{key} 不是数值")
         if value < floor:
             raise HardwareCostError(f"{context}.{key}={value} 低于下限 {floor}")
         checked[key] = float(value)
+    if checked["paging_ceiling_fraction"] > 1.0:
+        raise HardwareCostError(
+            f"{context}.paging_ceiling_fraction={checked['paging_ceiling_fraction']} "
+            "超过 1.0：常驻总量不可能大过物理显存还不分页")
+    if checked["engine_context_mb"] > 4096.0:
+        raise HardwareCostError(
+            f"{context}.engine_context_mb={checked['engine_context_mb']} 超过 4096MB："
+            "单个引擎进程的 CUDA 上下文不可能这么大，这行是填错的")
     if checked["fallback_tail_fraction"] > checked["max_tail_fraction"]:
+
         raise HardwareCostError(
             f"{context} 兜底重尾比例 {checked['fallback_tail_fraction']} "
             f"超过上限 {checked['max_tail_fraction']}，估算已失真")
@@ -167,7 +190,15 @@ def load_table(path: Optional[str] = None) -> dict:
             raise HardwareCostError("generic 是保留键，通用系数不可覆盖")
         if key in table:
             raise HardwareCostError(f"代价表 hardware_class 重复：{key}")
-        table[key] = _validate(machine.get("coefficients") or {}, f"machines[{index}]")
+        stored = machine.get("coefficients") or {}
+        # 早于某项系数写下的行不该让整张表失效：缺的键按"沿用通用值"处理，
+        # 与 provenance 里 measured/inherited 的既有语义一致。若在这里抛错，
+        # router 会把自动分层整体回退成 -ngl 999 全量卸载，比兜底值更糟。
+        absent = sorted(set(GENERIC_COEFFICIENTS) - set(stored))
+        if absent:
+            logger.warning(f"代价表 {key} 缺少系数 {absent}，按通用值继承")
+            stored = {**{k: GENERIC_COEFFICIENTS[k] for k in absent}, **stored}
+        table[key] = _validate(stored, f"machines[{index}]")
     return table
 
 

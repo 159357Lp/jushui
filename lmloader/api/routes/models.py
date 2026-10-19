@@ -40,6 +40,9 @@ class RunConfigBody(BaseModel):
     ubatch_size: Optional[int] = None
     mtp_enabled: Optional[bool] = None
     spec_draft_max: Optional[int] = None
+    # 手填的 --n-cpu-moe：-1 跟着自动分层解算，N 直接把 N 层专家留在内存。
+    # 共存让步要靠它才有可操作性——自动解只有"按预算退"一个方向。
+    cpu_moe_layers: Optional[int] = None
 
 
 # Run-config clamping lives in the engine router so BOTH the save path (here)
@@ -90,6 +93,7 @@ def _defaults_for_engine_slot(model) -> dict:
         "ubatch_size": d.ubatch_size,
         "mtp_enabled": d.mtp_enabled,
         "spec_draft_max": d.spec_draft_max,
+        "cpu_moe_layers": -1,
     }
 
 
@@ -116,7 +120,8 @@ async def save_model_run_config(model_name: str, body: RunConfigBody):
     merged = dict(saved or defaults)
     for key in ("ctx_size", "n_gpu_layers", "threads", "flash_attn",
                 "cache_type_k", "cache_type_v", "parallel",
-                "batch_size", "ubatch_size", "mtp_enabled", "spec_draft_max"):
+                "batch_size", "ubatch_size", "mtp_enabled", "spec_draft_max",
+                "cpu_moe_layers"):
         val = getattr(body, key, None)
         if val is not None:
             merged[key] = val
