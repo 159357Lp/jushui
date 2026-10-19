@@ -7,6 +7,7 @@ The GUI tails it via /api/events; everything is also appended to
 logs/server.log under the working directory so sessions survive restarts.
 """
 
+import os
 import time
 import threading
 from collections import deque
@@ -22,7 +23,11 @@ class EventLog:
         self._events: deque[dict] = deque(maxlen=maxlen)
         self._lock = threading.Lock()
         self._id = count(1)
-        log_path = Path(log_dir) if log_dir else Path.cwd() / "logs"
+        # LMLOADER_LOG_DIR 优先于 cwd：一次 pytest 只要落在仓库根，就会把 fixture
+        # 编出来的数字（"物理显存 8192MB"、模型名 35B/d3）追加进用户正在看的
+        # logs/server.log，事后读证据时分不清哪一行是真引擎说的。
+        log_path = Path(log_dir or os.environ.get("LMLOADER_LOG_DIR")
+                        or Path.cwd() / "logs")
         log_path.mkdir(parents=True, exist_ok=True)
         self._log_file = log_path / "server.log"
 
