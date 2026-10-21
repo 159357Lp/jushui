@@ -31,6 +31,11 @@ TABLE_VERSION = 1
 #   vram_safety_fraction: 空闲显存要再打折，桌面/显示与瞬时波动都吃显存
 #     （笔记本共享显存场景实测 Windows 桌面本身就占一块）。
 #   base_overhead_mb: 计算缓冲 + 运行期固定开销；MTP 附加层已并入层均值，不重复计。
+#     注意这一项是按**某一只模型**量出来的，而它里面混着的循环状态（RS）是随模型
+#     几何与草稿深度变的：校准用的 35B-A3B 只用了 188.44 MiB，同一张卡上那只
+#     27B NVFP4 草稿深度 2 就用了 448.88 MiB。所以行里另存 overhead_rs_mb，
+#     规划器只对超出它的部分计价（见 offload_planner.recurrent_state_mb），
+#     既不重复扣一遍，也不会拿一只模型的 state 去盖另一只。
 #   fallback_tail_fraction: 没有 vocab 元数据时按权重总量比例预留重尾。
 #   max_tail_fraction: 重尾上限——embedding+output 不可能超过总权重一半，
 #     超了说明估算失真。
@@ -52,6 +57,9 @@ GENERIC_COEFFICIENTS = {
     "prewarm_ram_margin": 1.25,
     "paging_ceiling_fraction": 0.80,
     "engine_context_mb": 256.0,
+    # base_overhead_mb 里混着的循环状态量。没有拆分记录的历史行按 0 处理，
+    # 意思是"这一项一分都没替你扣"，规划器就足额计模型自己的状态——多扣不少扣。
+    "overhead_rs_mb": 0.0,
 }
 
 
@@ -92,6 +100,9 @@ class CostCoefficients:
     # 引擎进程自身的 CUDA 上下文，自报口径看不见；带默认值，早于它写下的实测行
     # 仍能被读出（load_table 会按通用值补齐）。
     engine_context_mb: float = 256.0
+    # base_overhead_mb 中已包含的循环状态（RS）字节；见模块注释。老行缺这项时按
+    # 0 继承，规划器全额计价本模型的状态，宁可多扣。
+    overhead_rs_mb: float = 0.0
     # 哪张表算出来的账必须跟着进日志，否则事后无从判断是不是又用了兜底值。
     source: str = GENERIC_HARDWARE_CLASS
 
@@ -110,7 +121,7 @@ def _validate(coefficients: dict, context: str) -> dict:
     for key, floor in (("vram_safety_fraction", 0.0), ("fallback_tail_fraction", 0.0),
                        ("max_tail_fraction", 0.0), ("prewarm_ram_margin", 1.0),
                        ("base_overhead_mb", 0.0), ("paging_ceiling_fraction", 0.0),
-                       ("engine_context_mb", 0.0)):
+                       ("engine_context_mb", 0.0), ("overhead_rs_mb", 0.0)):
         value = coefficients[key]
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise HardwareCostError(f"{context}.{key} 不是数值")
@@ -125,6 +136,11 @@ def _validate(coefficients: dict, context: str) -> dict:
         raise HardwareCostError(
             f"{context}.engine_context_mb={checked['engine_context_mb']} 超过 4096MB："
             "单个引擎进程的 CUDA 上下文不可能这么大，这行是填错的")
+    if checked["overhead_rs_mb"] > checked["base_overhead_mb"]:
+        raise HardwareCostError(
+            f"{context}.overhead_rs_mb={checked['overhead_rs_mb']} 超过固定开销总量 "
+            f"{checked['base_overhead_mb']}：状态缓冲不可能比整个开销还大。要么这行"
+            "填错，要么它记的是另一只模型的状态，把它填成 0 让规划器足额计价")
     if checked["fallback_tail_fraction"] > checked["max_tail_fraction"]:
 
         raise HardwareCostError(

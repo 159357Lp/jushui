@@ -21,6 +21,11 @@ NInfer 那种逐专家常驻在 GGUF 上没有对应物。
     预算一开局就被 KV 吃光，后面的卸载决策全部作废。
   * 只信空闲显存：nvidia-smi 的 free 已经把已加载模型、桌面占用算在
     里面，所以单次加载不会把显存顶爆。
+  * 循环状态（RS）单独计价：混合模型的大多数层不存 KV，存一份与 ctx 无关的
+     recurrent 状态，KV 那一项一字节都盖不住它。它按草稿深度整份翻倍
+    （实测 27B NVFP4：不开草稿 149.62MB，深度 1/2/4 = 299.25/448.88/748.12），
+    而按卡实测的 base_overhead_mb 里混着的是**校准那只模型**的 188.44MB，
+    盖不住另一只。所以行里记 overhead_rs_mb，规划器只扣超出的部分。
   * 但"不顶爆"不等于"共存最优"：free 只会拦住后加载的那个，绝不为它把
     已在卡上的模型往下压，两个引擎合计仍能落在 WDDM 分页区一起掉速。
     多模型常驻由 plan_coexistence 用整卡上限定账（见下）。
@@ -85,6 +90,54 @@ def kv_elements_per_token(meta: dict) -> Optional[float]:
     return float(kv_layers * heads * (k_len + v_len))
 
 
+def recurrent_state_mb(meta: dict, draft_positions: int = 0,
+                       parallel: int = 1) -> Optional[float]:
+    """MiB of recurrent-state memory a hybrid model pins on the card.
+
+    Returns 0.0 for a pure-attention model (no such buffer exists), None when the
+    file is hybrid but its state geometry is unreadable — the caller must then
+    leave the term unpriced rather than invent a bound — and the byte count
+    otherwise. llama.cpp allocates it as f32, once per sequence slot, on every
+    layer that is *not* one of the `full_attention_interval`-th KV layers.
+
+    Anchored on the user's 27B NVFP4 flagship, whose engine printed the state
+    sizes for four draft depths at ctx 16000 / parallel 1 (`-lv 4`, one line per
+    buffer): 149.62 MiB with no draft, 299.25 at --spec-draft-n-max 1, 448.88 at
+    2, 748.12 at 4. The formula reproduces all four exactly, including the
+    R/S split the engine reports alongside (48 state layers x 30720 conv
+    elements = 5.625 MiB and x 786432 ssm elements = 144.00 MiB).
+
+    The (1 + draft_positions) multiplier is the measured part that matters most
+    for planning: speculative decoding re-allocates the *whole stack's* state
+    once per draft position, so a depth-2 MTP draft costs 299 MiB of VRAM that
+    has nothing to do with ctx size. Parallel slots are multiplied the same way;
+    only parallel=1 is anchored, and the direction of that guess is conservative.
+    """
+    trunk = int(meta.get("block_count") or 0)
+    if meta.get("supports_mtp"):
+        # block_count counts the draft group (n_layer_all); llama.cpp sizes the
+        # recurrent memory over n_layer, which excludes it.
+        trunk -= 1
+    interval = int(meta.get("full_attention_interval") or 0)
+    if trunk <= 0:
+        return None
+    if interval <= 1:
+        return 0.0
+    conv_kernel = int(meta.get("ssm_conv_kernel") or 0)
+    state_size = int(meta.get("ssm_state_size") or 0)
+    group_count = int(meta.get("ssm_group_count") or 0)
+    inner_size = int(meta.get("ssm_inner_size") or 0)
+    if not (conv_kernel and state_size and group_count and inner_size):
+        return None
+    state_layers = trunk - trunk // interval
+    conv = max(conv_kernel - 1, 0) * (2 * group_count * state_size + inner_size)
+    ssm = inner_size * state_size
+    elements = state_layers * (conv + ssm)
+    if elements <= 0:
+        return None
+    return elements * 4.0 / (1024 * 1024) * (1 + max(0, int(draft_positions))) * max(1, int(parallel))
+
+
 @dataclass
 class OffloadPlan:
     n_gpu_layers: int          # 最终 -ngl；999 = 全量卸载（含 MTP/辅助层）
@@ -100,6 +153,8 @@ class OffloadPlan:
     reason: str                # 一句中文账目，进事件日志
     cpu_moe_layers: int = 0    # -ncmoe：把这些层数的专家权重留在 CPU
     predicted_vram_mb: float = 0.0   # 本档预计常驻（权重＋满额 KV，不含引擎缓冲）
+    rs_full_mb: float = 0.0    # 本模型循环状态总量（含草稿深度倍数）；0=不适用或未知
+    rs_charged_mb: float = 0.0  # 实际从预算里扣除的超出代价系数行的那部分
 
     def as_dict(self) -> dict:
         return self.__dict__.copy()
@@ -210,20 +265,42 @@ def plan_offload(
     if not (layers and hidden and size_mb >= 1):
         return None
 
-    layers_total = layers + (1 if meta.get("supports_mtp") else 0)
+    # blk_groups 与 layer_bytes 是 parser 一起发布的：有组数就说明实测字节可信，
+    # 每层均值就该按文件里真实的 blk 组数除。草稿嵌在最后一组（NVFP4-LOW 的
+    # blk.64.nextn.*）时，block_count+1=66 会把 65 层的体重摊到 66 层上，
+    # 单层估小 0.8%，全量门与部分卸载都跟着偏乐观。
+    groups = int(meta.get("blk_groups") or 0)
+    if not 0 < groups <= layers + 1:
+        # 组数只能比 block_count 多一个（草稿独立成组）。DB 里缓存的旧/坏 metadata
+        # 若报出别的数，宁可退回层算术，也不能拿它当每层均值的分母。
+        groups = 0
+    layers_total = groups or layers + (1 if meta.get("supports_mtp") else 0)
     ctx = int(cfg.get("ctx_size") or 4096)
     parallel = max(1, int(cfg.get("parallel") or 1))
 
-    # 重尾：embedding 与 output 两层合计 vocab×hidden×2字节×2（输入+输出表）。
-    # GGUF 惯例里这两张表基本保持 f16。
+    # 重尾：embedding 与 output 层。有张量表实测就用实测字节；没有才退回
+    # vocab×hidden×2字节×2 的 f16 猜测——量化表（NVFP4/三元）远小于 f16，
+    # 那个猜测能把重尾估大一倍，把单层均值估小一半，全量门随之误判。
     vocab = int(meta.get("vocab_size") or 0)
-    if vocab:
-        tail_mb = (2 * vocab * hidden * 2) / (1024 * 1024)
+    layer_bytes = int(meta.get("layer_bytes") or 0)
+    measured_tail_bytes = int(meta.get("tail_bytes") or 0)
+    measured = (layer_bytes > 1 << 20 and measured_tail_bytes > 1 << 20
+                and layer_bytes + measured_tail_bytes <= size_mb * 1024 * 1024)
+    if measured:
+        tail_mb = measured_tail_bytes / (1024 * 1024)
+        trunk_mb = layer_bytes / (1024 * 1024)
+        tail_src = "张量表实测"
     else:
-        tail_mb = size_mb * cost.fallback_tail_fraction
-    tail_mb = min(tail_mb, size_mb * cost.max_tail_fraction)
+        if vocab:
+            tail_mb = (2 * vocab * hidden * 2) / (1024 * 1024)
+            tail_src = "vocab×hidden 的 f16 估算"
+        else:
+            tail_mb = size_mb * cost.fallback_tail_fraction
+            tail_src = "按体量比例兜底"
+        # 估算值才需要封顶：实测字节不会凭空超过文件本身。
+        tail_mb = min(tail_mb, size_mb * cost.max_tail_fraction)
+        trunk_mb = max(size_mb - tail_mb, 1.0)
 
-    trunk_mb = max(size_mb - tail_mb, 1.0)
     avg_layer_mb = trunk_mb / layers_total
 
     # KV 只按上 GPU 的层预留，但满额先算出来作为线性方程的系数。
@@ -231,11 +308,42 @@ def plan_offload(
     kv_geometry_exact = kv_elems is not None
     if not kv_geometry_exact:
         kv_elems = 2 * hidden * layers_total
-    kv_full_mb = (ctx * kv_elems * _cache_bytes(cfg.get("cache_type_k", "q4_0"))
-                  / (1024 * 1024) * parallel)
+    cb = _cache_bytes(cfg.get("cache_type_k", "q4_0"))
+    kv_full_mb = ctx * kv_elems * cb / (1024 * 1024) * parallel
     kv_src = "几何精算" if kv_geometry_exact else "按 MHA 上限估计"
+    if kv_geometry_exact and meta.get("supports_mtp") and cfg.get("mtp_enabled", True):
+        # 开着 MTP 时草稿层的 KV 不吃 --cache-type-k/v：引擎一律按 f16 存这一层
+        # （实测 ctx 16000 → 63.0 MiB、65536 → 256.0 MiB，正好 1 层 × 4 头 ×
+        # (256+256) × 2B）。上面的 kv_elements_per_token 已经把这一层算进 trunk 的
+        # 量化价，这里只补差价，否则满 ctx 少算 184 MiB，解出来的 -ngl 偏激进。
+        # 关掉 MTP 就不能补：引擎那一趟压根不分配草稿 buffer，实测见
+        # _pydiag/spec_flags_results.csv 的 no_mtp 行（KV 只有 284，没有 ＋63）。
+        d_heads = int(meta.get("attention_head_count_kv") or 0)
+        d_k = int(meta.get("attention_key_length") or 0)
+        d_v = int(meta.get("attention_value_length") or 0) or d_k
+        if d_heads and d_k:
+            kv_full_mb += ctx * d_heads * (d_k + d_v) * (2.0 - cb) / (1024 * 1024) * parallel
+            kv_src = "几何精算＋草稿层按 f16"
 
-    budget_mb = free_vram_mb * cost.vram_safety_fraction - cost.base_overhead_mb
+    # 循环状态：与 ctx 无关，但随模型几何、草稿深度和槽位数走，代价系数行里
+    # 那笔混着的开销只覆盖校准用的那只模型。超出部分必须单独扣，否则规划器会
+    # 把状态大三倍的旗舰判成"装得下"——实测 32k/40k 全驻留塌到 4~5 t/s 就是这一笔。
+    draft_positions = 0
+    if meta.get("supports_mtp") and cfg.get("mtp_enabled", True):
+        # 与 router 下发 --spec-draft-n-max 的截断保持一致，规划算的是引擎真会
+        # 分配的那份，不是配置里写野了的数。
+        draft_positions = max(0, min(int(cfg.get("spec_draft_max") or 1), 16))
+    rs_full = recurrent_state_mb(meta, draft_positions, parallel)
+    rs_charged = max(0.0, (rs_full or 0.0) - cost.overhead_rs_mb)
+    if rs_full is None:
+        rs_note = "循环状态几何未知，未计价"
+    elif rs_charged > 0:
+        rs_note = (f"循环状态 {rs_full:.0f}MB（草稿深度 {draft_positions}×{parallel} 槽）"
+                   f"比系数行里的 {cost.overhead_rs_mb:.0f}MB 多 {rs_charged:.0f}MB")
+    else:
+        rs_note = f"循环状态 {rs_full:.0f}MB 已由系数行的 {cost.overhead_rs_mb:.0f}MB 覆盖"
+
+    budget_mb = free_vram_mb * cost.vram_safety_fraction - cost.base_overhead_mb - rs_charged
 
     moe = _moe_branch(meta, size_mb, budget_mb, kv_full_mb)
     if moe:
@@ -244,13 +352,14 @@ def plan_offload(
         if manual is not None:
             moe["cpu_moe_layers"] = manual
         n_keep = moe["moe_layers"] - moe["cpu_moe_layers"]
-        predicted_mb = moe["dense_mb"] + kv_full_mb + n_keep * moe["per_layer_mb"]
+        predicted_mb = (moe["dense_mb"] + kv_full_mb + n_keep * moe["per_layer_mb"]
+                        + rs_charged)
         prewarm = bool(
             moe["cpu_moe_layers"] and free_ram_mb
             and free_ram_mb >= size_mb * cost.prewarm_ram_margin)
         reason = (
             f"MoE 专家分层：空闲显存 {free_vram_mb:.0f}MB×{cost.vram_safety_fraction:.2f}−"
-            f"固定开销 {cost.base_overhead_mb:.0f}MB → 预算 {budget_mb:.0f}MB"
+            f"固定开销 {cost.base_overhead_mb:.0f}MB − {rs_note} → 预算 {budget_mb:.0f}MB"
             f"（系数来源：{cost.source}）；"
             f"权重 {size_mb:.0f}MB 中专家 {moe['expert_mb']:.0f}MB"
             f"（{moe['expert_count']} 选 {moe['expert_used']}，每层 {moe['per_layer_mb']:.0f}MB），"
@@ -269,6 +378,7 @@ def plan_offload(
             prewarm_suggested=prewarm, prewarm_mb=round(size_mb, 1),
             reason=reason, cpu_moe_layers=moe["cpu_moe_layers"],
             predicted_vram_mb=round(predicted_mb, 1),
+            rs_full_mb=round(rs_full or 0.0, 1), rs_charged_mb=round(rs_charged, 1),
         )
 
     if budget_mb <= 0:
@@ -280,7 +390,13 @@ def plan_offload(
         # 部压进显存，必须单独过一道全量门，不能信线性解的"≥总层数"。
         ngl_exact = budget_mb / (avg_layer_mb + kv_full_mb / layers_total)
         if ngl_exact >= layers_total:
-            if size_mb + kv_full_mb <= budget_mb:
+            # 全量门看的是引擎搬不走的那部分：实测过张量表时，块层＋满额 KV
+            # 装得下就放行 999，重尾由 llama.cpp 装载时自行留在内存（实测
+            # -ngl 66 把 token_embd 644MB 留在内存、output 833MB 压上卡，
+            # 自报显存权重 14160MB = 块层 13327＋833）。没有实测字节时不能
+            # 假设引擎会搬家，只能按整只文件的旧门判。
+            need_mb = (trunk_mb if measured else size_mb) + kv_full_mb
+            if need_mb <= budget_mb:
                 ngl_out, ngl_eff = 999, layers_total
             else:
                 ngl_out = ngl_eff = layers_total - 1
@@ -292,7 +408,7 @@ def plan_offload(
     predicted_mb = (
         size_mb + kv_full_mb if ngl_out == 999
         else ngl_eff * (avg_layer_mb + kv_full_mb / layers_total)
-    )
+    ) + rs_charged
 
     # 预热只在全量卸载之外有意义：真有层留在盘上按需缺页时才值得提前
     # 读进 page cache，且空闲 RAM 必须容得下整个模型并留余量。
@@ -302,9 +418,9 @@ def plan_offload(
 
     reason = (
         f"自动分层：空闲显存 {free_vram_mb:.0f}MB×{cost.vram_safety_fraction:.2f}−"
-        f"固定开销 {cost.base_overhead_mb:.0f}MB → 预算 {max(budget_mb, 0):.0f}MB"
+        f"固定开销 {cost.base_overhead_mb:.0f}MB − {rs_note} → 预算 {max(budget_mb, 0):.0f}MB"
         f"（系数来源：{cost.source}）；"
-        f"重尾预留 {tail_mb:.0f}MB（{'vocab 精算' if vocab else '均值兜底'}），"
+        f"重尾预留 {tail_mb:.0f}MB（{tail_src}），"
         f"单层均 {avg_layer_mb:.0f}MB，满额 KV {kv_full_mb:.0f}MB（ctx {ctx}×{parallel} 槽，{kv_src}），"
         f"解出 -ngl={ngl_out}，GPU 侧预计占 {predicted_mb:.0f}MB，留盘 {disk} 层"
         + (f"（{why}）" if why else "")
@@ -317,6 +433,7 @@ def plan_offload(
         prewarm_suggested=prewarm, prewarm_mb=round(size_mb, 1),
         reason=reason,
         predicted_vram_mb=round(predicted_mb, 1),
+        rs_full_mb=round(rs_full or 0.0, 1), rs_charged_mb=round(rs_charged, 1),
     )
 
 

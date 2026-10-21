@@ -145,6 +145,10 @@ def main():
         coeffs["base_overhead_mb"] = round(f["overhead_mb"], 1)
         coeffs["paging_ceiling_fraction"] = round(f["ceiling"], 4)
         coeffs["engine_context_mb"] = round(f["context_mb"], 1)
+        # 循环状态单独记一份：base_overhead_mb 是按**这只校准模型**量的，里面混着
+        # 它的 RS。规划器现在会按几何推每只模型自己的状态，行里不留这个数就没法
+        # 判断"超出多少"，校准模型自己会被扣两遍。
+        coeffs["overhead_rs_mb"] = round(f["buffers"]["recurrent"], 1)
         save_measurement(cls, coeffs, {
             "measured_at": "2026-10-19",
             "method": "_pydiag/calibrate_5080.py 同模型同参数只变 --n-cpu-moe，"
@@ -154,7 +158,8 @@ def main():
             "knee_ncmoe": f["star"]["ncmoe"],
             "knee_vram_weights_mib": f["star"]["vram_weights_mib"],
             "measured_fields": ["vram_safety_fraction", "base_overhead_mb",
-                                "paging_ceiling_fraction", "engine_context_mb"],
+                                "paging_ceiling_fraction", "engine_context_mb",
+                                "overhead_rs_mb"],
             "inherited_fields": ["fallback_tail_fraction", "max_tail_fraction",
                                  "prewarm_ram_margin"],
             "paging_ceiling_basis": "拐点档引擎合计峰值 ÷ 物理显存总量（常驻总量是全局性质，多引擎一起撞）",
@@ -171,7 +176,10 @@ def main():
     cfg = json.loads(open("_pydiag/ab_baseline_config.json", encoding="utf-8").read())["config"]
     fitted = CostCoefficients(**{**GENERIC_COEFFICIENTS,
                                  "vram_safety_fraction": f["safety"],
-                                 "base_overhead_mb": f["overhead_mb"]},
+                                 "base_overhead_mb": f["overhead_mb"],
+                                 # 自校验用的是校准模型本身：行里已经混着它的状态，
+                                 # 再让规划器按几何扣一遍就是两笔钱。
+                                 "overhead_rs_mb": f["buffers"]["recurrent"]},
                               source="拟合自本次扫描")
     if BREAK:
         fitted = CostCoefficients(**{**fitted.as_dict(),

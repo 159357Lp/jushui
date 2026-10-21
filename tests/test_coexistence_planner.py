@@ -94,12 +94,22 @@ def pair(*, incumbent=None, free_ram_mb=3700.0, vram_total_mb=VRAM_TOTAL,
 # ---------- 实测几何下的联合解 ----------
 
 def test_fixture_geometry_matches_the_measured_sweep():
-    """先钉住 fixture 本身：几何变了，下面所有断言就成了自欺。"""
+    """先钉住 fixture 本身：几何变了，下面所有断言就成了自欺。
+
+    198→244 的来由：planner 现在把 MTP 草稿层的 KV 按 f16 计（引擎不吃
+    --cache-type 的那条 buffer）。这条改动只在 NVFP4-LOW 上量过（kv_probe：
+    ctx 16000 → 63 MiB、65536 → 256 MiB，正好 1 层 × 4 头 × (256+256) × 2B）；
+    35B 这只没量过，244 = 主干 198 ＋ 草稿层 f16 差价 46 是公式输出，钉在这里
+    是为了让下面的联合解断言有稳定基线，不是实测。
+    旧锚点那句『引擎自报 KV 128 MiB』值得留个记号：128 恰是 ctx 65536 下草稿层
+    f16 buffer 的大小，而 lifecycle 的末条覆盖写法只会报出最后那一条——所以它
+    从来不是整张 KV 的量（任务 #21）。
+    """
     m = plan_offload(moe(), MOE_CFG, 1e9, None, coefficients=COST)
     d = plan_offload(d3(), D3_CFG, 1e9, None, coefficients=COST)
-    assert m.kv_full_mb == 198.0, m.kv_full_mb      # 实测 ctx32768 KV 64MB 的满额账
+    assert m.kv_full_mb == 244.0, m.kv_full_mb      # 主干 q4_0 ＋ 草稿层 f16
     assert d.kv_full_mb == 576.0, d.kv_full_mb
-    assert m.predicted_vram_mb == 21353.0            # size + kv，全量驻留
+    assert m.predicted_vram_mb == 21399.0            # size + kv，全量驻留
     assert m.cpu_moe_layers == 0 and m.n_gpu_layers == 999
 
 
@@ -154,7 +164,8 @@ def test_context_allowance_is_priced_once_per_process():
 def test_mounted_vision_encoder_pushes_the_incumbent_further_down():
     r0, r1 = pair(), pair_with_vision()
     assert r1.feasible, r1.reason
-    assert r1.plans["35B"].cpu_moe_layers == r0.plans["35B"].cpu_moe_layers + 1, \
+    # 挂载视觉必须让在用那只多让出专家层；具体让几层随 KV 计价变，方向不许变
+    assert r1.plans["35B"].cpu_moe_layers > r0.plans["35B"].cpu_moe_layers, \
         (r0.plans["35B"].reason, r1.plans["35B"].reason)
     assert r1.total_mb <= CEILING + 1.0, r1.reason
     assert "视觉编码器" in r1.reason, r1.reason

@@ -78,7 +78,77 @@ def test_repeated_reserve_overwrites_instead_of_accumulating():
         "9.99.999.999 I sched_reserve:      CUDA0 compute buffer size =   102.66 MiB"
     )
     assert inst.memory_breakdown()["vram"]["compute"] == before
-    assert len(inst.memory_buffers) == len(ENGINE_LOG)
+    assert len(inst.memory_buffers[("CUDA0", "compute")]) == 1
+
+
+# Verbatim from a real production-args load (`-lv 4`, --mmproj mounted,
+# --spec-type draft-mtp --spec-draft-n-max 2) of Qwen3.8-27B-NVFP4-MTP-LOW at
+# ctx 65536 / -ngl 60; the engine reached "model loaded" and the free-VRAM delta
+# for that process was measured at 15293 MiB. This is the run that proves one
+# (device, kind) can hold two real buffers: llama_kv_cache prints CUDA0 KV once
+# for the main context (q4_0) and once for the MTP draft context (f16), and the
+# draft's 256 MiB alone cannot explain 15293 MiB of occupancy.
+MTP_LOG = [
+    "0.02.158.570 I load_tensors:   CPU_Mapped model buffer size =  1876.76 MiB",
+    "0.02.158.571 I load_tensors:        CUDA0 model buffer size = 12927.69 MiB",
+    "0.06.291.140 I llama_context:  CUDA_Host  output buffer size =     0.95 MiB",
+    "0.06.291.661 I llama_kv_cache:        CPU KV buffer size =    72.00 MiB",
+    "0.06.298.124 I llama_kv_cache:      CUDA0 KV buffer size =  1080.00 MiB",
+    "0.06.317.810 I llama_memory_recurrent:        CPU RS buffer size =    46.76 MiB",
+    "0.06.325.536 I llama_memory_recurrent:      CUDA0 RS buffer size =   402.12 MiB",
+    "0.06.347.015 I sched_reserve:      CUDA0 compute buffer size =   501.75 MiB",
+    "0.06.347.021 I sched_reserve:  CUDA_Host compute buffer size =   144.63 MiB",
+    "0.06.717.389 I llama_context:  CUDA_Host  output buffer size =     0.95 MiB",
+    "0.06.718.414 I llama_kv_cache:      CUDA0 KV buffer size =   256.00 MiB",
+    "0.06.737.947 I sched_reserve:      CUDA0 compute buffer size =   132.02 MiB",
+    "0.06.737.952 I sched_reserve:  CUDA_Host compute buffer size =    84.02 MiB",
+    "0.07.442.884 I reserve_compute_meta:      CUDA0 compute buffer size =   248.10 MiB",
+    "0.07.442.888 I reserve_compute_meta:        CPU compute buffer size =    24.93 MiB",
+    "0.07.474.433 I sched_reserve:      CUDA0 compute buffer size =   132.02 MiB",
+    "0.07.474.438 I sched_reserve:  CUDA_Host compute buffer size =    84.02 MiB",
+]
+
+
+def test_main_and_draft_kv_are_two_buffers_not_one():
+    """The collapsed summary used to report the draft's 256 MiB as the whole KV."""
+    bd = _parse(MTP_LOG).memory_breakdown()
+    assert bd["vram"]["kv"] == 1080.00 + 256.00
+    assert bd["vram"]["weights"] == 12927.69
+    assert bd["vram"]["recurrent"] == 402.12
+    # 132.02 was printed twice by the same function: reprint, so 501.75+132.02
+    # from sched_reserve plus the 248.10 meta reservation, not 132.02 twice.
+    assert bd["vram"]["compute"] == pytest.approx(501.75 + 132.02 + 248.10)
+    assert bd["ram"]["kv"] == 72.00
+    assert bd["ram"]["compute"] == pytest.approx(144.63 + 84.02 + 24.93)
+    # the draft context shares the main one's output buffer size
+    assert bd["ram"]["output"] == 0.95
+
+
+def test_collapsing_to_the_last_line_under_reports_kv_5_times():
+    """Negative control: last-write-wins must not be mistaken for the split.
+
+    Re-implementing the old rule over the same lines has to produce the number
+    the GUI used to show, so a future "simplification" back to one value per
+    (device, kind) fails here instead of silently shrinking the account.
+    """
+    collapsed = {}
+    inst = _parse(MTP_LOG)
+    for line in MTP_LOG:
+        m = M._RE_MEMBUF.search(line)
+        collapsed[(m.group("device"), m.group("kind"))] = float(m.group("mib"))
+    old_kv = collapsed[("CUDA0", "KV")]
+    assert old_kv == 256.0
+    assert inst.memory_breakdown()["vram"]["kv"] != old_kv
+    assert inst.memory_breakdown()["vram"]["kv"] / old_kv == pytest.approx(5.22, abs=.01)
+
+
+def test_second_buffer_of_a_different_size_is_not_a_reprint():
+    """The pair of tests that separates "sum" from "keep the last" for good."""
+    inst = _parse(ENGINE_LOG)
+    inst.parse_memory_line(
+        "9.99.999.999 I llama_kv_cache:      CUDA0 KV buffer size =   256.00 MiB"
+    )
+    assert inst.memory_breakdown()["vram"]["kv"] == 96.0 + 256.0
 
 
 @pytest.mark.parametrize("line", [

@@ -92,10 +92,18 @@ class ModelInstance:
         self._stderr_raw: deque[str] = deque(maxlen=80)
         # slot -> latest timing metrics parsed from print_timing output
         self.latest_timing: dict[int, dict] = {}
-        # (device, kind) -> MiB, parsed from the engine's own allocation report.
-        # Latest value wins: sched_reserve reprints the compute buffers whenever
-        # the graph is re-reserved, so these are steady-state sizes, not a sum.
-        self.memory_buffers: dict[tuple[str, str], float] = {}
+        # (device, kind) -> the distinct allocations the engine printed for it,
+        # as (printing function, MiB). One key can legitimately hold several
+        # buffers: with MTP on, llama.cpp prints CUDA0 KV twice — the main
+        # context's q4_0 buffer and the draft context's f16 one (measured at ctx
+        # 65536 / -ngl 60: 1080.00 + 256.00 MiB, and the free-VRAM delta of
+        # 15293 MiB only reconciles if both are counted). But sched_reserve also
+        # reprints the *same* reservation on every graph re-reserve, so an
+        # identical (function, MiB) pair under one key is a reprint, not a second
+        # buffer. Two separate buffers of exactly the same size printed by the
+        # same function would be merged here — that costs at most the 0.95 MiB
+        # per-context output buffer, not a KV or weights line.
+        self.memory_buffers: dict[tuple[str, str], list[tuple[str, float]]] = {}
         self.memory_summary_emitted = False
         # d3 packages only: the System One contract reported by the package's
         # own server (modalities, token/media limits). None for other engines.
@@ -210,7 +218,16 @@ class ModelInstance:
         kind = self._MEM_KINDS.get(m.group("kind"))
         if not kind:
             return False
-        self.memory_buffers[(m.group("device"), kind)] = float(m.group("mib"))
+        # The printing function is what tells a second allocation apart from a
+        # reprint of the first: both the main and the draft KV cache are printed
+        # by llama_kv_cache, so only the size can separate them.
+        eng = self._RE_ENG_LINE.match(line)
+        tag = eng.group(3) if eng else "?"
+        entry = (tag, float(m.group("mib")))
+        buffers = self.memory_buffers.setdefault(
+            (m.group("device"), kind), [])
+        if entry not in buffers:
+            buffers.append(entry)
         return True
 
     def memory_breakdown(self) -> Optional[dict]:
@@ -225,7 +242,8 @@ class ModelInstance:
             "vram": {}, "ram": {},
         }
         devices: dict[str, dict[str, float]] = {}
-        for (device, kind), mib in self.memory_buffers.items():
+        for (device, kind), entries in self.memory_buffers.items():
+            mib = sum(v for _tag, v in entries)
             bucket = self._device_bucket(device)
             buckets[bucket][kind] = buckets[bucket].get(kind, 0.0) + mib
             devices.setdefault(device, {})[kind] = mib

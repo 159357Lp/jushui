@@ -16,7 +16,7 @@ from lmloader.logger import logger
 # what it already stores. scanner._fingerprint mixes this into its cache key, so
 # a new field reaches already-registered models on the next scan instead of
 # silently staying absent (the planner would then fall back forever).
-PARSER_SCHEMA = 2
+PARSER_SCHEMA = 4
 
 _BONSAI_QUANT_MAP = {
     141: "PQ2_0_TERNARY",
@@ -99,10 +99,17 @@ class GGUFMetadata:
         expert_used: int = 0,
         moe_layer_count: int = 0,
         expert_bytes: int = 0,
+        layer_bytes: int = 0,
+        tail_bytes: int = 0,
+        blk_groups: int = 0,
         attention_head_count_kv: int = 0,
         attention_key_length: int = 0,
         attention_value_length: int = 0,
         full_attention_interval: int = 0,
+        ssm_conv_kernel: int = 0,
+        ssm_state_size: int = 0,
+        ssm_group_count: int = 0,
+        ssm_inner_size: int = 0,
     ):
         self.architecture = architecture
         self.quantization = quantization
@@ -121,10 +128,17 @@ class GGUFMetadata:
         self.expert_used = expert_used
         self.moe_layer_count = moe_layer_count
         self.expert_bytes = expert_bytes
+        self.layer_bytes = layer_bytes
+        self.tail_bytes = tail_bytes
+        self.blk_groups = blk_groups
         self.attention_head_count_kv = attention_head_count_kv
         self.attention_key_length = attention_key_length
         self.attention_value_length = attention_value_length
         self.full_attention_interval = full_attention_interval
+        self.ssm_conv_kernel = ssm_conv_kernel
+        self.ssm_state_size = ssm_state_size
+        self.ssm_group_count = ssm_group_count
+        self.ssm_inner_size = ssm_inner_size
         self.raw_metadata = raw_metadata
 
     @property
@@ -154,11 +168,96 @@ class GGUFMetadata:
             "expert_used": self.expert_used,
             "moe_layer_count": self.moe_layer_count,
             "expert_bytes": self.expert_bytes,
+            "layer_bytes": self.layer_bytes,
+            "tail_bytes": self.tail_bytes,
+            "blk_groups": self.blk_groups,
             "attention_head_count_kv": self.attention_head_count_kv,
             "attention_key_length": self.attention_key_length,
             "attention_value_length": self.attention_value_length,
             "full_attention_interval": self.full_attention_interval,
+            "ssm_conv_kernel": self.ssm_conv_kernel,
+            "ssm_state_size": self.ssm_state_size,
+            "ssm_group_count": self.ssm_group_count,
+            "ssm_inner_size": self.ssm_inner_size,
         }
+
+
+_KV_FIXED_SIZE = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1,
+                  10: 8, 11: 8, 12: 8}
+
+
+def _skip_gguf_value(fh, vtype: int):
+    """按 GGUF 类型跳过 KV 值。只读长度，不解释内容。"""
+    if vtype == 8:                      # string
+        fh.read(struct.unpack("<Q", fh.read(8))[0])
+    elif vtype == 9:                    # array: 元素类型 + 个数
+        et = struct.unpack("<I", fh.read(4))[0]
+        n = struct.unpack("<Q", fh.read(8))[0]
+        if et in _KV_FIXED_SIZE:
+            fh.read(_KV_FIXED_SIZE[et] * n)
+        else:
+            for _ in range(n):          # 变长元素（字符串/嵌套数组）逐个走
+                _skip_gguf_value(fh, et)
+    elif vtype in _KV_FIXED_SIZE:
+        fh.read(_KV_FIXED_SIZE[vtype])
+    else:
+        raise ValueError(f"未知 GGUF KV 类型 {vtype}")
+
+
+def _walk_tensor_sizes(path: Path) -> tuple[int, int, int]:
+    """返回 (blk.* 张量字节合计, 其余重尾字节合计, blk 层组数)。
+
+    只走张量表，用相邻 offset 相减得到每个张量的真实字节：既不需要 mmap
+    （20GB 级文件在 Windows 上会 WinError 1455 直接失败），也不依赖 ggml 类型
+    表认不认识 NVFP4/PQ2_0_TERNARY 这些自定义量化——所以量化模型的重尾大小
+    是文件里读出来的，而不是按 f16 猜的。
+    """
+    layer_bytes = tail_bytes = 0
+    groups = set()
+    with open(path, "rb") as fh:
+        head = fh.read(24)
+        if len(head) < 24 or head[:4] != b"GGUF":
+            raise ValueError("不是 GGUF 文件头")
+        n_tensors = struct.unpack_from("<Q", head, 8)[0]
+        n_kv = struct.unpack_from("<Q", head, 16)[0]
+        if not 0 < n_tensors < 1_000_000 or n_kv > 100_000:
+            raise ValueError(f"张量/KV 数量不合理：{n_tensors}/{n_kv}")
+        align = 32
+        for _ in range(n_kv):
+            klen = struct.unpack("<Q", fh.read(8))[0]
+            key = fh.read(klen)
+            vtype = struct.unpack("<I", fh.read(4))[0]
+            if key == b"general.alignment" and vtype in (2, 3, 4, 5):
+                raw = fh.read(_KV_FIXED_SIZE[vtype])
+                align = abs(int.from_bytes(raw, "little",
+                                           signed=vtype in (3, 5))) or 32
+                continue
+            _skip_gguf_value(fh, vtype)
+        tensors = []
+        for _ in range(n_tensors):
+            nlen = struct.unpack("<Q", fh.read(8))[0]
+            name = fh.read(nlen).decode("utf-8", "replace")
+            nd = struct.unpack("<I", fh.read(4))[0]
+            fh.read(8 * nd)                                  # dims
+            fh.read(4)                                       # dtype
+            tensors.append((name, struct.unpack("<Q", fh.read(8))[0]))
+        pos = fh.tell()
+        data_start = (pos + align - 1) // align * align
+        total = path.stat().st_size
+        tensors.sort(key=lambda t: t[1])
+        for i, (name, off) in enumerate(tensors):
+            nxt = tensors[i + 1][1] if i + 1 < len(tensors) else total - data_start
+            size = max(0, nxt - off)
+            if name.startswith("blk."):
+                layer_bytes += size
+                head = name.split(".", 2)
+                if len(head) > 1 and head[1].isdigit():
+                    groups.add(int(head[1]))
+            else:
+                tail_bytes += size
+    if layer_bytes + tail_bytes > total:
+        raise ValueError("张量字节合计超过文件大小：offset 推算法不成立")
+    return layer_bytes, tail_bytes, len(groups)
 
 
 def parse_gguf(file_path: str, force: bool = False) -> Optional[GGUFMetadata]:
@@ -246,7 +345,30 @@ def parse_gguf(file_path: str, force: bool = False) -> Optional[GGUFMetadata]:
             **_read_expert_shape(reader, architecture),
             **_read_kv_shape(reader, architecture, embedding_length,
                              attention_head_count),
+            **_read_ssm_shape(reader, architecture),
         )
+
+        # 实测张量字节：分层解算器靠这两个数区分『块层』与『重尾』，比按
+        # vocab×hidden×2 猜 f16 准得多（NVFP4/三元量化的表远小于 f16 猜测）。
+        # 只有 blk 组数与层算术对得上才发布，对不上就留 0 让 planner 退回估算
+        # ——宁可退回粗估，也不能把对不上号的字节当成每层均值拿去解 -ngl。
+        # MTP 草稿的落法有两种：独立 blk.N 组（Qwen3.8-Coder 那种）或嵌在最后一
+        # 组里（NVFP4-LOW 实测 blk.64.nextn.*，65 组而 block_count=65）。旧判据
+        # 只认前者，把这只 flagship 的实测字节整个拦掉，planner 至今仍按 f16 猜
+        # 重尾——两种都对上号才发布，组数照实发布给 planner 当层数。
+        try:
+            lb, tb, groups = _walk_tensor_sizes(path)
+            allowed = {block_count} | ({block_count + 1} if supports_mtp else set())
+            if groups and groups in allowed:
+                metadata.layer_bytes, metadata.tail_bytes = lb, tb
+                metadata.blk_groups = groups
+            else:
+                logger.warning(
+                    f"Tensor walk skipped for {path.name}: {groups} blk groups "
+                    f"not in {sorted(allowed)} (block_count={block_count}, "
+                    f"mtp={int(supports_mtp)})")
+        except Exception as e:
+            logger.warning(f"Tensor size walk failed for {path.name}: {e}")
 
         logger.info(f"Parsed GGUF: {path.name} - {architecture} {quantization} {parameters}")
         return metadata
@@ -500,6 +622,33 @@ def _read_kv_shape(reader, architecture, embedding_length, head_count) -> dict:
         "attention_key_length": k_len,
         "attention_value_length": v_len,
         "full_attention_interval": interval,
+    }
+
+
+def _read_ssm_shape(reader, architecture) -> dict:
+    """Collect the recurrent-state geometry a hybrid model's memory costs.
+
+    A hybrid file (qwen35 / qwen3next / mamba) keeps no KV cache on most of its
+    layers — those layers hold a fixed-size recurrent state per sequence slot
+    instead. Nothing in the KV budget sees it: the cost does not scale with ctx,
+    so a model can ask llama.cpp for a few hundred MiB of state that no existing
+    term accounts for, and on the user's 27B NVFP4 flagship the speculative
+    draft multiplier makes that 448.88 MiB (measured; see
+    offload_planner.recurrent_state_mb for the arithmetic and the anchor).
+
+    Only the llama.cpp-owned field names are accepted. A converter that stores
+    the same shapes under other keys yields zeros, and the planner then declines
+    to price the state rather than guess it from `embedding_length`.
+    """
+    return {
+        "ssm_conv_kernel": _read_int_alias(reader, architecture,
+                                           "ssm.conv_kernel", "mamba.conv_kernel"),
+        "ssm_state_size": _read_int_alias(reader, architecture,
+                                          "ssm.state_size", "mamba.state_size"),
+        "ssm_group_count": _read_int_alias(reader, architecture,
+                                           "ssm.group_count", "mamba.n_groups"),
+        "ssm_inner_size": _read_int_alias(reader, architecture,
+                                          "ssm.inner_size", "mamba.inner_size"),
     }
 
 
