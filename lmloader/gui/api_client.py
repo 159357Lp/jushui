@@ -182,6 +182,39 @@ class LMLoaderAPI:
         resp.raise_for_status()
         return resp.json()
 
+    def register_model_paths(self, paths: list[str]) -> dict:
+        # One POST can walk a whole library picked off an external drive: that is
+        # a GGUF header parse per file over slow removable IO, so it must NOT
+        # inherit scan_models' 60s budget.
+        resp = http_post(
+            f"{self.base_url}/api/models/register-paths",
+            json={"paths": paths},
+            headers=self._headers(),
+            timeout=600.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def list_extra_model_roots(self) -> list[str]:
+        try:
+            resp = http_get(
+                f"{self.base_url}/api/models/extra-roots", headers=self._headers(), timeout=10.0
+            )
+            resp.raise_for_status()
+            return resp.json().get("roots", [])
+        except Exception:
+            return []
+
+    def remove_extra_model_root(self, path: str) -> dict:
+        resp = http_delete(
+            f"{self.base_url}/api/models/extra-roots",
+            params={"path": path},
+            headers=self._headers(),
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     def get_engine(self) -> dict:
         try:
             resp = http_get(f"{self.base_url}/api/engine", headers=self._headers(), timeout=10.0)

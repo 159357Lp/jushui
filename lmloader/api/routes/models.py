@@ -28,6 +28,10 @@ class VisionRequest(BaseModel):
     enabled: bool
 
 
+class RegisterPathsRequest(BaseModel):
+    paths: list[str]
+
+
 class RunConfigBody(BaseModel):
     ctx_size: Optional[int] = None
     n_gpu_layers: Optional[int] = None
@@ -105,9 +109,15 @@ async def get_model_run_config(model_name: str):
     saved = await db.get_run_config(model_name)
     defaults = _defaults_for_engine_slot(model)
     info = model.to_dict()
-    if saved is None:
-        return {"model_name": model_name, "saved": False, "config": defaults, "model": info}
-    return {"model_name": model_name, "saved": True, "config": saved, "model": info}
+    # 存档里没填的键（NULL）必须显示成"实际会生效的那一份"：router 的 _pick 遇到
+    # None 一律退回槽默认，而模型页的线程框在拿到 None 时退回 os.cpu_count()（逻辑核
+    # 32）。两条默认不一致，于是"打开对话框看一眼再保存"就会把 8 写成 32——实测
+    # 32/24 都比 8 慢。saved 标记仍按"有没有存档行"给，徽标语义不变。
+    config = dict(defaults)
+    if saved:
+        config.update({k: v for k, v in saved.items() if v is not None})
+    return {"model_name": model_name, "saved": saved is not None,
+            "config": config, "model": info}
 
 
 @router.post("/models/{model_name}/config")
@@ -159,6 +169,30 @@ async def list_models(status: Optional[str] = None):
 async def get_loaded_models():
     loaded = await lifecycle.get_loaded_models()
     return {"loaded": loaded}
+
+
+# These three must stay declared ABOVE GET /models/{model_id}: Starlette matches
+# on the path regex first and validates afterwards, so a route declared later
+# would answer 422 ("extra-roots" is not an int) instead of reaching this handler.
+@router.post("/models/register-paths")
+async def register_model_paths(request: RegisterPathsRequest):
+    """Register models picked from any drive; directories are remembered as roots."""
+    if not request.paths:
+        raise HTTPException(status_code=400, detail="paths 不能为空")
+    return await scanner.register_paths(request.paths)
+
+
+@router.get("/models/extra-roots")
+async def list_extra_model_roots():
+    return {"roots": await db.list_extra_roots()}
+
+
+@router.delete("/models/extra-roots")
+async def remove_extra_model_root(path: str):
+    removed = await scanner.remove_root(path)
+    if removed is None:
+        raise HTTPException(status_code=404, detail=f"这个目录不在已记住的模型路径里: {path}")
+    return {"status": "removed", "path": removed}
 
 
 @router.get("/models/{model_id}")

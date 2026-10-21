@@ -139,6 +139,34 @@ TRANSLATIONS = {
         "models.found": "{count} 个模型, {loaded} 个已加载",
         "models.scanning": "扫描中...",
         "models.scan_complete": "扫描完成: {count} 个模型",
+        "models.pick_paths": "选择模型路径",
+        "models.pick_paths_tip": (
+            "从别的盘挑模型。左键选文件夹：整个目录登记进库并被记住，以后每次\"扫描文件\"都会复查它；"
+            "右键本按钮可以只登记一个文件，或管理已记住的目录。"
+        ),
+        "models.pick_title": "选择要登记的模型文件",
+        "models.pick_dir_title": "选择模型文件夹（整个目录会被记住）",
+        "models.pick_file": "只登记一个模型文件…",
+        "models.pick_done": "登记完成",
+        "models.pick_no_change": "登记完成：模型库没有变化",
+        "models.picking": "正在登记选中的路径...",
+        "models.pick_added": "新增 {count} 只",
+        "models.pick_existing": "已在库里 {count} 只",
+        "models.pick_moved": "改指新路径 {count} 只",
+        "models.pick_roots": "记住目录 {count} 个",
+        "models.pick_rejected": "拒绝 {count} 个",
+        "models.pick_cancelled": "已取消，未改动模型库",
+        "models.manage_paths": "管理已记住的路径",
+        "models.roots_title": "已记住的模型路径",
+        "models.roots_hint": (
+            "移除只是不再复查这个目录；已经登记的模型仍留在库里，"
+            "除非那个文件本身不见了。"
+        ),
+        "models.roots_empty": "还没有记住任何目录。点\"选择模型路径\"挑一个文件夹就会记住。",
+        "models.roots_remove": "移除选中",
+        "models.roots_removed": "已移除: {path}",
+        "models.roots_pick_one": "先在列表里选中一个目录",
+        "models.close": "关闭",
         "models.loading_model": "正在加载 {name}...",
         "models.loaded": "已加载: {name}",
         "models.unloading": "正在卸载 {name}...",
@@ -609,6 +637,35 @@ TRANSLATIONS = {
         "models.found": "{count} models found, {loaded} loaded",
         "models.scanning": "Scanning...",
         "models.scan_complete": "Scan complete: {count} models found",
+        "models.pick_paths": "Pick model path",
+        "models.pick_paths_tip": (
+            "Pick models from another drive. Left-click chooses a folder: everything inside "
+            "is registered and the directory is remembered, so later scans revisit it. "
+            "Right-click registers a single file or manages the remembered directories."
+        ),
+        "models.pick_title": "Select a model file to register",
+        "models.pick_dir_title": "Select a model folder (the whole directory is remembered)",
+        "models.pick_file": "Register a single model file...",
+        "models.pick_done": "Registered",
+        "models.pick_no_change": "Done: the model library is unchanged",
+        "models.picking": "Registering the selected paths...",
+        "models.pick_added": "{count} added",
+        "models.pick_existing": "{count} already in library",
+        "models.pick_moved": "{count} re-pointed to the new path",
+        "models.pick_roots": "{count} directories remembered",
+        "models.pick_rejected": "{count} rejected",
+        "models.pick_cancelled": "Cancelled; the model library is unchanged",
+        "models.manage_paths": "Manage remembered paths",
+        "models.roots_title": "Remembered model paths",
+        "models.roots_hint": (
+            "Removing a path only stops future scans from revisiting it; models already "
+            "registered stay in the library until the file itself disappears."
+        ),
+        "models.roots_empty": "No directories remembered yet. Pick a folder to remember one.",
+        "models.roots_remove": "Remove selected",
+        "models.roots_removed": "Removed: {path}",
+        "models.roots_pick_one": "Select a directory in the list first",
+        "models.close": "Close",
         "models.loading_model": "Loading {name}...",
         "models.loaded": "Loaded: {name}",
         "models.unloading": "Unloading {name}...",

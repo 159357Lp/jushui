@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
     QPushButton, QLabel, QMessageBox, QListView,
     QDialog, QFormLayout, QSpinBox, QCheckBox, QComboBox,
-    QSizePolicy,
+    QSizePolicy, QFileDialog, QMenu,
 )
 from PySide6.QtCore import Qt, QSize, QTimer
 from PySide6.QtGui import QFont, QFontMetrics, QGuiApplication
@@ -506,6 +506,74 @@ class ModelConfigDialog(QDialog):
         self._t = t
 
 
+class ExtraRootsDialog(QDialog):
+    """Forget remembered model directories.
+
+    Forgetting only stops future scans from revisiting the folder — the records
+    it registered stay until the file itself disappears, and the hint says so in
+    the user's language rather than letting 移除 read like 删除.
+    """
+
+    def __init__(self, api: LMLoaderAPI, roots: list[str], parent=None):
+        super().__init__(parent)
+        self.api = api
+        self._threads: list = []
+        self.setWindowTitle(tr("models.roots_title"))
+        self.resize(560, 320)
+
+        layout = QVBoxLayout(self)
+        hint = QLabel(tr("models.roots_hint"))
+        hint.setObjectName("subtitle")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.list = QListWidget()
+        if roots:
+            self.list.addItems(roots)
+        else:
+            self._append_placeholder()
+        layout.addWidget(self.list, 1)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        self.remove_btn = QPushButton(tr("models.roots_remove"))
+        self.remove_btn.clicked.connect(self._remove)
+        btns.addWidget(self.remove_btn)
+        close_btn = QPushButton(tr("models.close"))
+        close_btn.clicked.connect(self.accept)
+        btns.addWidget(close_btn)
+        layout.addLayout(btns)
+
+    def _append_placeholder(self):
+        """灰色提示行 —— 它不是目录，不能被"移除选中"当成路径提交。"""
+        item = QListWidgetItem(tr("models.roots_empty"))
+        item.setFlags(Qt.NoItemFlags)
+        self.list.addItem(item)
+
+    def _remove(self):
+        item = self.list.currentItem()
+        if item is None or not (item.flags() & Qt.ItemIsSelectable):
+            QMessageBox.information(self, tr("models.roots_title"), tr("models.roots_pick_one"))
+            return
+        path = item.text()
+
+        def do_remove():
+            return self.api.remove_extra_model_root(path)
+
+        def on_result(_r):
+            self.list.takeItem(self.list.row(item))
+            if self.list.count() == 0:
+                self._append_placeholder()
+            if self.parent() is not None and hasattr(self.parent(), "set_pick_status"):
+                self.parent().set_pick_status(tr("models.roots_removed").format(path=path))
+
+        def on_error(err):
+            QMessageBox.critical(self, tr("models.error_title"), tr("models.error_prefix").format(err=err))
+
+        t = run_in_thread(do_remove, on_result, on_error)
+        self._threads.append(t)
+
+
 class ModelsPage(QWidget):
     def __init__(self, api: LMLoaderAPI):
         super().__init__()
@@ -544,6 +612,17 @@ class ModelsPage(QWidget):
         title.setObjectName("title")
         header.addWidget(title)
         header.addStretch()
+
+        self.pick_btn = QPushButton(tr("models.pick_paths"))
+        self.pick_btn.setToolTip(tr("models.pick_paths_tip"))
+        self.pick_btn.clicked.connect(self._pick_paths)
+        # One button, two very different costs: choosing a folder registers and
+        # remembers a whole library, while a single file is a one-off. The native
+        # Windows folder picker can't mix the two in one dialog, so the file is
+        # reached through the context menu instead.
+        self.pick_btn.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.pick_btn.customContextMenuRequested.connect(self._show_paths_menu)
+        header.addWidget(self.pick_btn)
 
         self.scan_btn = QPushButton(tr("models.scan_files"))
         self.scan_btn.clicked.connect(self._scan)
@@ -948,6 +1027,104 @@ class ModelsPage(QWidget):
 
         t = run_in_thread(do_scan, on_result, on_error)
         self._threads.append(t)
+
+    # ------------------------------------------------------------- pick paths
+
+    def set_pick_status(self, text: str):
+        self.status_label.setText(text)
+
+    def _pick_paths(self):
+        start = ""
+        # 本地文件夹对话框，初始路径留空让系统记住上次位置
+        picked = QFileDialog.getExistingDirectory(self, tr("models.pick_dir_title"), start)
+        if not picked:
+            self.status_label.setText(tr("models.pick_cancelled"))
+            return
+        self._register([picked])
+
+    def _pick_files(self):
+        picked, _flt = QFileDialog.getOpenFileName(
+            self, tr("models.pick_title"), "",
+            "Model files (*.gguf *.ggml *.bin *.onnx *.engine);;All files (*)",
+        )
+        if not picked:
+            self.status_label.setText(tr("models.pick_cancelled"))
+            return
+        self._register([picked])
+
+    def _show_paths_menu(self, pos):
+        menu = QMenu(self)
+        menu.addAction(tr("models.pick_file"), self._pick_files)
+        menu.addAction(tr("models.manage_paths"), self._manage_paths)
+        menu.exec(self.pick_btn.mapToGlobal(pos))
+
+    def _manage_paths(self):
+        def fetch():
+            return self.api.list_extra_model_roots()
+
+        def on_result(roots):
+            ExtraRootsDialog(self.api, roots, self).exec()
+
+        def on_error(err):
+            self.status_label.setText(tr("models.error_prefix").format(err=err))
+
+        t = run_in_thread(fetch, on_result, on_error)
+        self._threads.append(t)
+
+    def _register(self, paths: list[str]):
+        self.pick_btn.setEnabled(False)
+        self.scan_btn.setEnabled(False)
+        self.status_label.setText(tr("models.picking"))
+
+        def do_register():
+            return self.api.register_model_paths(paths)
+
+        def on_result(result):
+            self._apply_pick_result(result)
+
+        def on_error(err):
+            self.status_label.setText(tr("models.error_prefix").format(err=err))
+            self.pick_btn.setEnabled(True)
+            self.scan_btn.setEnabled(True)
+
+        t = run_in_thread(do_register, on_result, on_error)
+        self._threads.append(t)
+
+    def _apply_pick_result(self, result: dict):
+        self.pick_btn.setEnabled(True)
+        self.scan_btn.setEnabled(True)
+        self.status_label.setText(self._format_pick_result(result))
+        # 同名但两条路径都还在盘上时，后端会给出带换行的两行路径对照。这种
+        # 必须弹窗而不是塞进状态栏：状态栏一行放不下，用户会以为登记成功了。
+        conflicts = [
+            r for r in (result.get("rejected") or [])
+            if "\n" in str(r.get("reason", ""))
+        ]
+        if conflicts:
+            QMessageBox.warning(
+                self, tr("models.error_title"),
+                "\n\n".join(f"{r['path']}\n{r['reason']}" for r in conflicts),
+            )
+        if (result.get("registered") or result.get("moved")):
+            self._refresh()
+
+    def _format_pick_result(self, result: dict) -> str:
+        fragments = (
+            ("registered", "models.pick_added"),
+            ("moved", "models.pick_moved"),
+            ("existing", "models.pick_existing"),
+            ("roots", "models.pick_roots"),
+            ("rejected", "models.pick_rejected"),
+        )
+        bits = []
+        for key, frag in fragments:
+            count = len(result.get(key) or [])
+            if count:
+                bits.append(tr(frag).format(count=count))
+        if not bits:
+            return tr("models.pick_no_change")
+        # 分隔符不用任何一侧的标点，中英两种语言读起来都不别扭。
+        return tr("models.pick_done") + " · " + " · ".join(bits)
 
     def _open_config(self, model_name: str):
         self.status_label.setText(tr("models.cfg_loading").format(name=model_name))

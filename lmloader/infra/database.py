@@ -98,6 +98,12 @@ class Database:
                     updated_at TEXT NOT NULL
                 )
             """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS model_extra_roots (
+                    path TEXT PRIMARY KEY,
+                    added_at TEXT NOT NULL
+                )
+            """)
             # Lightweight migration for databases created before new columns.
             cursor = await db.execute("PRAGMA table_info(model_run_configs)")
             existing_cols = {row[1] for row in await cursor.fetchall()}
@@ -219,6 +225,21 @@ class Database:
             )
             await db.commit()
 
+    async def update_model_path(self, model_id: int, path: str):
+        """Re-point a record at a file that moved.
+
+        Only the explicit user-pick path calls this: a same-name file found at a
+        new location is ambiguous, so the caller must first confirm the recorded
+        path no longer exists on disk.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            now = datetime.now().isoformat()
+            await db.execute(
+                "UPDATE models SET path = ?, updated_at = ? WHERE id = ?",
+                (path, now, model_id),
+            )
+            await db.commit()
+
     async def delete_model(self, model_id: int):
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("DELETE FROM models WHERE id = ?", (model_id,))
@@ -295,6 +316,35 @@ class Database:
             cursor = await db.execute("SELECT model_name FROM model_run_configs")
             rows = await cursor.fetchall()
             return {row["model_name"] for row in rows}
+
+    # ---- extra model roots (directories picked outside config model_dirs) ----
+
+    async def add_extra_root(self, path: str) -> bool:
+        """Remember one model directory. Returns False if it was already known."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                INSERT OR IGNORE INTO model_extra_roots (path, added_at)
+                VALUES (?, ?)
+                """,
+                (path, datetime.now().isoformat()),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def list_extra_roots(self) -> list[str]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("SELECT path FROM model_extra_roots ORDER BY path")
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
+    async def delete_extra_root(self, path: str) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "DELETE FROM model_extra_roots WHERE path = ?", (path,)
+            )
+            await db.commit()
+            return cursor.rowcount > 0
 
     def _row_to_model(self, row) -> ModelRecord:
         return ModelRecord(
