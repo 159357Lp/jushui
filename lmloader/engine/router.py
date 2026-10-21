@@ -439,6 +439,7 @@ class EngineRouter:
             "parallel": _pick("parallel", defaults.parallel),
             "batch_size": _pick("batch_size", getattr(defaults, "batch_size", 2048)),
             "ubatch_size": _pick("ubatch_size", getattr(defaults, "ubatch_size", 512)),
+            "cache_ram_mb": _pick("cache_ram_mb", getattr(defaults, "cache_ram_mb", 1024)),
             "mtp_enabled": _pick("mtp_enabled", getattr(defaults, "mtp_enabled", True)),
             "spec_draft_max": _pick("spec_draft_max", getattr(defaults, "spec_draft_max", 2)),
             "reasoning_budget": _pick("reasoning_budget", getattr(defaults, "reasoning_budget", -1)),
@@ -500,6 +501,7 @@ class EngineRouter:
         mtp_enabled = cfg["mtp_enabled"]
         spec_draft_max = cfg["spec_draft_max"]
         reasoning_budget = cfg["reasoning_budget"]
+        cache_ram_mb = cfg["cache_ram_mb"]
 
         # Surface a down-clamp so the runtime log explains why ctx differs from
         # the configured value instead of silently shrinking it.
@@ -533,6 +535,19 @@ class EngineRouter:
 
         args += ["--parallel", str(parallel)]
         args += ["--threads", str(threads)]
+
+        # Prompt-cache ceiling (llama.cpp default 8192 MiB). Every conversation
+        # branch kept in this cache costs a full set of context checkpoints
+        # (~150-190 MiB each), so an unbounded cache quietly eats several GB on
+        # top of an already-full card — measured 2026-10-21: 6 branches / 4754 MiB
+        # drove decode from 51-70 t/s down to 2.4 t/s. 0 disables the cache;
+        # negative means "don't touch it" and keeps the engine default.
+        try:
+            cache_ram_mb = int(cache_ram_mb)
+        except (TypeError, ValueError):
+            cache_ram_mb = -1
+        if cache_ram_mb >= 0:
+            args += ["--cache-ram", str(cache_ram_mb)]
 
         # Verbosity 4 is what makes libllama print its per-device allocation
         # report (model / KV / recurrent-state / compute buffer sizes). At the

@@ -284,3 +284,30 @@ def test_auto_tier_wires_the_cpu_moe_flag(router, monkeypatch, cpu_moe, expect):
     assert ("--n-cpu-moe" in args) is expect
     if expect:
         assert args[args.index("--n-cpu-moe") + 1] == "20"
+
+
+@pytest.mark.parametrize("cache_ram,expect", [
+    (None, "1024"),      # 槽默认必须真的落到启动参数里，不能只在配置里躺着
+    (512, "512"),
+    (0, "0"),            # 0 = 关掉 prompt cache，仍要传下去
+    (-1, None),          # 负数 = 不传，保持引擎自己的 8192
+])
+def test_cache_ram_ceiling_reaches_the_engine(router, monkeypatch, cache_ram, expect):
+    """--cache-ram 决定整卡常驻时还能不能塞进第 6 条对话分支。
+
+    2026-10-21 实测：引擎默认 8192 的缓存堆到 6 条分支 4754 MiB，解码从
+    51-70 t/s 塌到 2.4 t/s，所以这个上限必须由 掬水 显式下发。
+    """
+    from lmloader.config import EngineDefaultsConfig
+    monkeypatch.setattr(router, "resolve_engine", lambda m: ("primary", "llama"))
+    model = _make_record("qwen35-27b-mtp-nvfp4.gguf", "qwen35")
+    rc = {} if cache_ram is None else {"cache_ram_mb": cache_ram}
+    args = router.build_launch_config(model, 8178, run_config=rc).args
+    if expect is None:
+        assert "--cache-ram" not in args
+        return
+    assert "--cache-ram" in args
+    assert args[args.index("--cache-ram") + 1] == expect
+    if cache_ram is None:
+        # 默认值本身就是判据的一部分：改小改大都要在这里被看见
+        assert EngineDefaultsConfig().cache_ram_mb == 1024

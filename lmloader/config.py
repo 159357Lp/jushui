@@ -17,6 +17,12 @@ class EngineDefaultsConfig(BaseModel):
     threads: int = 8
     batch_size: int = 2048
     ubatch_size: int = 512
+    # llama.cpp 的 prompt cache 上限（MiB），引擎默认 8192。整卡常驻的模型上，
+    # 这个缓存会按对话分支累积 context checkpoint：2026-10-21 实测 6 条分支
+    # 存到 4754 MiB（其中 9379 token 那条独占 2108 MiB），显存余 136MB、内存余
+    # 1.7GB 两头一起缺页，解码从 51-70 t/s 塌到 2.4 t/s。1024 足够缓存一两条
+    # 长提示，又不会让第 6 条分支把卡挤穿。-1 = 不传该参数，保持引擎默认。
+    cache_ram_mb: int = 1024
     mtp_enabled: bool = True
     # Draft depth for MTP speculative decoding. Benchmarked on RTX 50-series
     # (Qwen3.5-9B NVFP4, official b11541): d1=148, d2=160, d3=162, d4=141 t/s;
