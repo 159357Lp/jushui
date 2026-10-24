@@ -16,6 +16,7 @@ from lmloader.config import settings
 from lmloader.engine.registry import engine_registry
 from lmloader.engine.router import LaunchConfig, router
 from lmloader.infra.database import ModelRecord, db
+from lmloader.engine import run_stats
 from lmloader.infra.events import event_log
 from lmloader.infra.proc_util import (
     assign_process_to_job,
@@ -32,6 +33,10 @@ from lmloader.logger import logger
 # well under the client timeout so the failure mode stays "no answer" rather
 # than "wrong answer".
 REAP_TIMEOUT = 5.0
+
+# 加载前的机器空闲量只是给"为什么这次崩"留的一条判别数据，不值得让加载多等。
+# 超过这个时间就当没测到（表里写"没报"），由 _host_free_snapshot 的 wait_for 执行。
+_HOST_PROBE_TIMEOUT = 3.0
 
 # llama-common echoes every resolved parameter and tokenizer detail, but only
 # once verbosity passes its default. We assembled those arguments ourselves, so
@@ -64,6 +69,26 @@ def is_decision_model(model: ModelRecord, engine_kind: str) -> bool:
     get the same answer from one implementation.
     """
     return engine_kind == "d3" or router.is_decision_model(model)
+
+
+async def _host_free_snapshot() -> Optional[dict]:
+    """加载前机器上还剩多少内存/显存（MiB）；探测不可用就返回 None。
+
+    nvidia-smi 自带 10s 超时，但加载不该为一条观测数据等那么久 —— 卡住就当作没测到，
+    宁可表里写"没报"，也不让这一列把一次加载拖住。
+    """
+    from lmloader.engine import offload_planner
+
+    def probe():
+        return {"free_ram_mb": offload_planner.free_ram_mb(),
+                "free_vram_mb": offload_planner.free_vram_mb()}
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(probe),
+                                      timeout=_HOST_PROBE_TIMEOUT)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"加载前空闲量探测失败: {e}")
+        return None
 
 
 class ModelInstance:
@@ -105,6 +130,16 @@ class ModelInstance:
         # per-context output buffer, not a KV or weights line.
         self.memory_buffers: dict[tuple[str, str], list[tuple[str, float]]] = {}
         self.memory_summary_emitted = False
+        # prompt 缓存的**实时占用**（引擎每轮 update 打一条 "cache state: N prompts,
+        # X MiB (limits: L MiB, T tokens...)"）。这跟 --cache-ram 设的上限是两回事：
+        # 上限是"设了多少"，这条才是"当下占了多少"。2026-10-21 那次 2.4 t/s 的塌陷
+        # 就是占用（6 条 4754 MiB）逼近上限（8192 MiB）时发生的，光看配置列查不出来。
+        # None = 这条引擎版本/级别下没打过，不写成 0。
+        self.cache_state: Optional[dict] = None
+        # 速度档案的"负载上下文"：加载那一刻有谁同驻、当时解算出的显存账。
+        # 由 load_model 填，_parse_timing 每条记录原样带走——没有它，同一个配置
+        # 在不同共存状态下跑出的速度差会被当成配置差异。
+        self.run_env: dict = {}
         # d3 packages only: the System One contract reported by the package's
         # own server (modalities, token/media limits). None for other engines.
         self.system_one: Optional[dict] = None
@@ -160,6 +195,11 @@ class ModelInstance:
             "flash_attn": self._arg_value("--flash-attn"),
             "metrics": self._latest_metrics(),
             "memory": self.memory_breakdown(),
+            "cache_state": self.cache_state,
+            # 这一行给实时区用：它记的是"这次加载之前"机器还剩多少，加载后不再变，
+            # 所以要跟 cache_state（每次请求都刷新）一样能读到，否则当场就看不出
+            # bad allocation 是不是主机内存不够。
+            "host_free": (self.run_env or {}).get("host"),
         }
 
     def _latest_metrics(self) -> Optional[dict]:
@@ -269,6 +309,31 @@ class ModelInstance:
             f"+ 状态 {r.get('recurrent', 0):.0f} + 计算 {r.get('compute', 0):.0f} MiB"
         )
 
+    # llama.cpp prints this on every srv update once the prompt cache is wired
+    # up: "cache state: 6 prompts, 4754.323 MiB (limits: 8192.000 MiB, 16128
+    # tokens, 8589934592 est)". The trailing "est" field appeared with the
+    # -4139-era cache accounting and is absent on older builds, so it is optional.
+    _RE_CACHE_STATE = re.compile(
+        r"cache state:\s*(?P<prompts>\d+)\s+prompts,\s*(?P<mib>[0-9]+(?:\.[0-9]+)?)\s*MiB"
+        r"\s*\(limits:\s*(?P<limit_mib>[0-9]+(?:\.[0-9]+)?)\s*MiB,\s*"
+        r"(?P<limit_tokens>\d+)\s+tokens(?:,\s*(?P<est>\d+)\s+est)?\)"
+    )
+
+    def parse_cache_state_line(self, line: str) -> bool:
+        """Record the live prompt-cache occupancy. True if this line was one."""
+        m = self._RE_CACHE_STATE.search(line)
+        if not m:
+            return False
+        self.cache_state = {
+            "prompts": int(m.group("prompts")),
+            "mib": float(m.group("mib")),
+            "limit_mib": float(m.group("limit_mib")),
+            "limit_tokens": int(m.group("limit_tokens")),
+            "est": int(m.group("est")) if m.group("est") else None,
+            "ts": time.time(),
+        }
+        return True
+
     # print_timing line patterns (llama.cpp / PrismML fork share these)
     _RE_TG = re.compile(
         r"print_timing:\s*id\s+(\d+)\s*\|.*?n_gen\s*=\s*(\d+)\s*,\s*tg\s*=\s*([\d.]+)\s*t/s"
@@ -287,8 +352,11 @@ class ModelInstance:
         r"\s*,\s*mean len\s*=\s*([\d.]+)"
     )
 
-    def _parse_timing(self, line: str) -> None:
-        """Parse one engine line; on a print_timing hit, record metrics + event."""
+    def _parse_timing(self, line: str):
+        """Parse one engine line; on a print_timing hit, record metrics + event.
+
+        返回一条速度档案记录（仅生成收尾那条），由 _read_stderr 落库。
+        """
         m = self._RE_ACCEPT.search(line)
         if m:
             rate, accepted, generated, mean_len = m.groups()
@@ -358,6 +426,17 @@ class ModelInstance:
                 metrics={"kind": "tg_final", "tg": float(tps),
                          "gen_tokens": int(tokens)},
             )
+            lc = self.launch_config
+            return run_stats.build_record(
+                model_name=self.model.name,
+                args=getattr(lc, "args", None) or [],
+                engine_kind=getattr(lc, "kind", None),
+                build=getattr(lc, "engine_slot", None),
+                snap=snap, slot=slot,
+                env={**getattr(self, "run_env", {}),
+                     "mem": self.memory_breakdown(),
+                     "cache": self.cache_state},
+            )
 
     @staticmethod
     def _slot_from_line(line: str) -> int:
@@ -417,12 +496,25 @@ class ModelInstance:
                 # instead of raw engine log noise.
                 if "print_timing" in cleaned:
                     try:
-                        self._parse_timing(cleaned)
+                        rec = self._parse_timing(cleaned)
                     except Exception as e:  # noqa: BLE001
                         logger.debug(f"timing parse error: {e}")
+                        continue
+                    if rec is not None:
+                        # The write is best-effort: a sqlite hiccup must never
+                        # stop this drain, because a full stderr pipe freezes
+                        # the engine mid-generation.
+                        try:
+                            await db.add_run_stat(rec)
+                        except Exception as e:  # noqa: BLE001
+                            logger.debug(f"run stat write failed: {e}")
                     continue
                 if self.parse_memory_line(cleaned):
                     continue
+                # Recorded, then left to follow its existing log path: at -lv 3
+                # this line is already echoed to Developer Logs, and the parse
+                # must not change what he sees there.
+                self.parse_cache_state_line(cleaned)
                 low = cleaned.lower()
                 m = self._RE_ENG_LINE.match(cleaned)
                 eng_level = m.group(1) if m else ""
@@ -854,6 +946,10 @@ class LifecycleManager:
                 model=model.name, engine_slot=engine_slot, port=port,
             )
             load_start = time.time()
+            # 机器在"这一次加载之前"还剩多少：bad allocation / 加载期塌陷这两类失败
+            # 只有显存数字判不出来（权重全量上卡时主机侧还要一份工作集），
+            # 所以必须在 spawn 之前取，取晚了就是把引擎自己刚吃掉的量当成"当时的空闲"。
+            host_free = await _host_free_snapshot()
 
             try:
                 env = self._build_env(launch_config)
@@ -873,6 +969,11 @@ class LifecycleManager:
             instance = ModelInstance(
                 model, process, launch_config,
                 pinned=is_decision_model(model, engine_kind),
+            )
+            # Snapshot the launch environment before self.instances gains this
+            # entry: co_resident must be "who else was on the card", not myself.
+            instance.run_env = run_stats.startup_context(
+                env=env, co_resident=list(self.instances), host=host_free,
             )
             instance.start_stderr_reader()
 
@@ -917,6 +1018,11 @@ class LifecycleManager:
                 self._used_ports.discard(port)
                 return False
 
+            # 加载完成后再测一次：只有"加载前"的数字说不出这次加载吃掉了多少主机内存，
+            # 而"加载完只剩 0.9G"正是第一次请求 bad allocation 的直接原因。
+            instance.run_env["host"] = run_stats.host_with_after(
+                instance.run_env.get("host"), await _host_free_snapshot())
+
             self.instances[model.name] = instance
             self._used_ports.add(port)
             await self._safe_status_update(model.id, "loaded")
@@ -932,6 +1038,11 @@ class LifecycleManager:
                 vision_part = f"，决策模型（模态：{modalities or 'text'}，走 /v1/systemone）"
             if instance.pinned:
                 vision_part += "，已钉选：模型切换与闲置均不自动卸载"
+            # 加载这一笔到底吃掉了多少机器资源，当场写在日志里：下一次 bad allocation
+            # 不用再开任务管理器猜。没测到时 format_host 会给"该引擎不传"占位文本。
+            host_txt = run_stats.format_host(instance.run_env.get("host"))
+            if host_txt != run_stats.NOT_PASSED:
+                vision_part += f"，机器空闲 {host_txt}"
             logger.info(
                 f"Loaded {model.name} on port {port} (PID={process.pid}, engine={engine_slot})"
             )

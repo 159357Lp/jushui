@@ -195,6 +195,18 @@ async def remove_extra_model_root(path: str):
     return {"status": "removed", "path": removed}
 
 
+@router.get("/models/run-stats")
+async def list_run_stats(recent: int = 10):
+    """每只模型一行：最高/中位/最低那三次运行的完整配置与速度，加最近 N 次。
+
+    recent 只做上限保护（页面固定要 10 条，留人手动拉大时不许把整表拖回来）。
+    当前正在跑的那次不在这里 —— 它还没生成完、没有可归档的配置，走 /models/loaded
+    的 metrics 读，两边不重复计。
+    """
+    rows = await db.get_run_stats(recent=max(1, min(int(recent), 200)))
+    return {"models": rows, "total": sum(r["count"] for r in rows)}
+
+
 @router.get("/models/{model_id}")
 async def get_model(model_id: int):
     model = await db.get_model(model_id)

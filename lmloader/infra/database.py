@@ -57,6 +57,41 @@ class ModelRecord:
         }
 
 
+def _stat_view(row):
+    """把一行运行记录转成页面直接渲染的形状：三个 JSON 字段解开。
+
+    JSON 解不开时不返回空 dict——那会让一条坏记录看起来像"这次没配任何参数"。
+    改成带 _parse_error 的标记，页面会把它显示成一整条原文。
+    """
+    if not row:
+        return None
+
+    def _load(key):
+        raw = row.get(key)
+        if raw in (None, ""):
+            return None
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return {"_parse_error": str(raw)}
+
+    return {
+        "ts": row.get("ts"),
+        "source": row.get("source"),
+        "slot": row.get("slot"),
+        "decode_tps": row.get("decode_tps"),
+        "prefill_tps": row.get("prefill_tps"),
+        "prompt_tokens": row.get("prompt_tokens"),
+        "cached_tokens": row.get("cached_tokens"),
+        "gen_tokens": row.get("gen_tokens"),
+        "engine_kind": row.get("engine_kind"),
+        "build": row.get("build"),
+        "args": _load("args_json"),
+        "cfg": _load("cfg_json"),
+        "env": _load("env_json"),
+    }
+
+
 class Database:
     def __init__(self):
         self.db_path = Path(settings.database.path)
@@ -103,6 +138,31 @@ class Database:
                     path TEXT PRIMARY KEY,
                     added_at TEXT NOT NULL
                 )
+            """)
+            # 每次生成的"速度 + 当时怎么跑的"配成一行。args/cfg/env 三列存 JSON 原文，
+            # 这样任何我没列进映射表的参数也留在 args 里，不会因为解析漏项而凭空消失。
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS model_run_stats (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model_name TEXT NOT NULL,
+                    ts TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'live',
+                    slot INTEGER,
+                    decode_tps REAL,
+                    prefill_tps REAL,
+                    prompt_tokens INTEGER,
+                    cached_tokens INTEGER,
+                    gen_tokens INTEGER,
+                    engine_kind TEXT,
+                    build TEXT,
+                    args_json TEXT,
+                    cfg_json TEXT,
+                    env_json TEXT
+                )
+            """)
+            await db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_run_stats_model_ts
+                ON model_run_stats (model_name, ts)
             """)
             # Lightweight migration for databases created before new columns.
             cursor = await db.execute("PRAGMA table_info(model_run_configs)")
@@ -345,6 +405,93 @@ class Database:
             )
             await db.commit()
             return cursor.rowcount > 0
+
+    async def add_run_stat(self, rec: dict, keep_per_model: int = 5000) -> int:
+        """写一条运行记录，并把该模型超出上限的最旧记录裁掉。
+
+        args_json/cfg_json 是两个互补字段：前者是引擎 argv 逐字原文（含 -m 的模型路径），
+        后者是从 argv 解出来的生效配置。只存后者的话，任何我没预料到的 flag 都会静默丢失，
+        所以两个都存，页面按 cfg 渲染已知项、把 args 里多出来的原样列进"其他参数"。
+        注意 cfg 是 argv 里的值，不是 model_run_configs 那份请求值——夹取和自动分层
+        解算会在加载时改写 n_gpu_layers，存请求值会让表和实际跑的不是一回事。
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO model_run_stats
+                (model_name, ts, source, slot, decode_tps, prefill_tps, prompt_tokens,
+                 cached_tokens, gen_tokens, engine_kind, build, args_json, cfg_json, env_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    rec["model_name"],
+                    rec.get("ts") or datetime.now().isoformat(timespec="seconds"),
+                    rec.get("source", "live"),
+                    rec.get("slot"),
+                    rec.get("decode_tps"),
+                    rec.get("prefill_tps"),
+                    rec.get("prompt_tokens"),
+                    rec.get("cached_tokens"),
+                    rec.get("gen_tokens"),
+                    rec.get("engine_kind"),
+                    rec.get("build"),
+                    json.dumps(rec.get("args") or [], ensure_ascii=False),
+                    json.dumps(rec.get("cfg") or {}, ensure_ascii=False),
+                    json.dumps(rec.get("env") or {}, ensure_ascii=False),
+                ),
+            )
+            await db.execute(
+                """
+                DELETE FROM model_run_stats
+                WHERE model_name = ? AND id NOT IN (
+                    SELECT id FROM model_run_stats WHERE model_name = ?
+                    ORDER BY id DESC LIMIT ?)
+                """,
+                (rec["model_name"], rec["model_name"], int(keep_per_model)),
+            )
+            await db.commit()
+            return cursor.lastrowid
+
+    async def count_run_stats(self) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("SELECT COUNT(*) FROM model_run_stats")
+            row = await cursor.fetchone()
+            return int(row[0])
+
+    async def get_run_stats(self, recent: int = 10) -> list:
+        """每个模型一行：条数、最高/最低/中位那条的完整记录、最近 N 条。
+
+        排序只用 decode_tps 非空的记录（没有生成速度的行不参与排名，但仍计入最近列表）。
+        中位取排序后的中间那条**真实记录**而不是插值——插出来的数没有对应配置，
+        放进这张表就成了没法核对的假行。
+        """
+        out = []
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT DISTINCT model_name FROM model_run_stats ORDER BY model_name")
+            names = [r[0] for r in await cursor.fetchall()]
+            for name in names:
+                cursor = await db.execute(
+                    "SELECT * FROM model_run_stats WHERE model_name = ? ORDER BY id DESC",
+                    (name,))
+                rows = [dict(r) for r in await cursor.fetchall()]
+                ranked = [r for r in rows if r.get("decode_tps") is not None]
+                high = low = med = None
+                if ranked:
+                    srt = sorted(ranked, key=lambda r: float(r["decode_tps"]))
+                    low, high = srt[0], srt[-1]
+                    med = srt[(len(srt) - 1) // 2]
+                out.append({
+                    "model_name": name,
+                    "count": len(rows),
+                    "ranked_count": len(ranked),
+                    "high": _stat_view(high),
+                    "median": _stat_view(med),
+                    "low": _stat_view(low),
+                    "recent": [_stat_view(r) for r in rows[:int(recent)]],
+                })
+        return out
 
     def _row_to_model(self, row) -> ModelRecord:
         return ModelRecord(

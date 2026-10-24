@@ -19,6 +19,7 @@ from lmloader.gui.pages.download import DownloadPage
 from lmloader.gui.pages.settings import SettingsPage
 from lmloader.gui.pages.monitor import MonitorPage
 from lmloader.gui.pages.logs import LogsPage
+from lmloader.gui.pages.run_stats import RunStatsPage
 from lmloader.gui.styles import apply_theme, c as theme_color
 from lmloader.gui.wallpaper import WallpaperHost
 from lmloader.gui.icons import app_icon
@@ -208,6 +209,7 @@ class MainWindow(QMainWindow):
             ("nav.monitor",  "控", "Mn",  "monitor"),
             ("nav.logs",     "服", "Srv", "logs"),
             ("nav.settings", "设", "Set", "settings"),
+            ("nav.run_stats", "档", "Arc", "run_stats"),
         ]
 
         self.nav_buttons: list[QPushButton] = []
@@ -334,7 +336,7 @@ class MainWindow(QMainWindow):
                 painter.drawRoundedRect(QRectF(3.5, y, 17, 6), 2, 2)
                 painter.drawEllipse(QPointF(7, y + 3), 0.8, 0.8)
                 painter.drawLine(QPointF(11, y + 3), QPointF(17, y + 3))
-        else:
+        elif index == 5:
             painter.drawEllipse(QPointF(12, 12), 4, 4)
             painter.drawEllipse(QPointF(12, 12), 8, 8)
             for angle in range(0, 360, 45):
@@ -343,6 +345,11 @@ class MainWindow(QMainWindow):
                 painter.rotate(angle)
                 painter.drawLine(QPointF(0, -11), QPointF(0, -8))
                 painter.restore()
+        else:
+            # 档案箱：盖子 + 箱体 + 提手（速度档案页）
+            painter.drawRoundedRect(QRectF(3.5, 4, 17, 4.5), 1.2, 1.2)
+            painter.drawRoundedRect(QRectF(5, 8.5, 14, 11.5), 1.5, 1.5)
+            painter.drawLine(QPointF(9.5, 13), QPointF(14.5, 13))
 
         painter.end()
         return QIcon(pixmap)
@@ -371,6 +378,10 @@ class MainWindow(QMainWindow):
         self.settings_page = SettingsPage(self.api)
         self.stack.addWidget(self.settings_page)
         self.pages["settings"] = self.settings_page
+
+        self.run_stats_page = RunStatsPage(self.api)
+        self.stack.addWidget(self.run_stats_page)
+        self.pages["run_stats"] = self.run_stats_page
 
     def _navigate(self, index: int):
         previous_page = self.stack.currentWidget()

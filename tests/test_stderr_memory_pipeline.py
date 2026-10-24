@@ -21,6 +21,21 @@ _RE_TIMESTAMP = re.compile(r"^\d+(?:\.\d+){3}\s+")
 _SERVER_MODULES = {"srv", "cmn", "slot", "spec"}
 _ECHO_TAGS = {"common_param", "common_init_", "common_params_fit_impl"}
 
+@pytest.fixture(autouse=True)
+def _isolated_run_stats_db(tmp_path, monkeypatch):
+    """_read_stderr 会往 model_run_stats 落行，不隔离就是往真库里写。
+
+    2026-10-22 在真库里查到 16 条本文件造的 d3-mini 假行（decode 恒 12.45、
+    prompt 3 / gen 40、ctx 为空），最晚一批的时间戳正对着一次套件运行。那张表
+    现在是速度档案页和塌陷判据的唯一来源，掺进合成行就等于污染结论。
+    """
+    from lmloader.infra import database as db_mod
+
+    monkeypatch.setattr(db_mod.db, "db_path", tmp_path / "pipeline.db")
+    asyncio.run(db_mod.db.init())
+    yield
+
+
 @pytest.fixture
 def engine_stderr_lines():
     path = Path(__file__).parent / "fixtures" / "llama_stderr_v4.log"

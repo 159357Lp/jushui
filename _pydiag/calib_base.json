@@ -1,0 +1,1 @@
+{"ctx_size": 16000, "n_gpu_layers": 66, "threads": 8, "flash_attn": true, "cache_type_k": "q4_0", "cache_type_v": "q4_0", "parallel": 1, "batch_size": 1600, "ubatch_size": 512, "mtp_enabled": true, "spec_draft_max": 2, "cpu_moe_layers": -1}

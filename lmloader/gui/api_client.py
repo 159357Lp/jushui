@@ -215,6 +215,23 @@ class LMLoaderAPI:
         resp.raise_for_status()
         return resp.json()
 
+    def fetch_run_stats_or_none(self, recent: int = 10) -> dict | None:
+        """速度档案。失败返回 None，而不是空列表。
+
+        页面要把三态分开：没查到（后端挂了）／查到但没有记录／查到有记录。把失败
+        折成空列表，后端一挂界面就显示"还没有运行记录"，那是假绿灯。
+        """
+        try:
+            resp = http_get(
+                f"{self.base_url}/api/models/run-stats",
+                params={"recent": int(recent)},
+                headers=self._headers(), timeout=10.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            return None
+
     def get_engine(self) -> dict:
         try:
             resp = http_get(f"{self.base_url}/api/engine", headers=self._headers(), timeout=10.0)
