@@ -19,7 +19,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 import demo_capture_alpha as alpha
-from lmloader.gui import theme_picker
+from lmloader.gui import styles, theme_picker
 
 
 @pytest.fixture(scope="module")
@@ -28,7 +28,23 @@ def qapp():
 
 
 @pytest.fixture()
-def head_shaped_row(qapp):
+def style_restored(qapp):
+    """把主题与壁纸全局原样放回。
+
+    这几条判据要真的构造滑杆行，而勾选壁纸开关会走真实预览链路，把
+    ``styles._wallpaper`` 改成非空 —— 那是进程级全局，后面的页面样式表会跟着换内衬，
+    于是别处的按钮尺寸判据会被带红（实测 ``test_chat_actions`` 的图标按钮 30 > 28）。
+    """
+    saved = (styles._wallpaper, styles.current_theme, qapp.palette(), qapp.styleSheet())
+    yield
+    styles.set_wallpaper(saved[0])
+    styles.current_theme = saved[1]
+    qapp.setPalette(saved[2])
+    qapp.setStyleSheet(saved[3])
+
+
+@pytest.fixture()
+def head_shaped_row(qapp, style_restored):
     """真的滑杆行，但剥掉只有防抖版才有的预览定时器。"""
     row = theme_picker.CustomThemeRow()
     if hasattr(row, "_preview_timer"):
@@ -41,7 +57,7 @@ def test_quiet_survives_row_without_preview_timer(head_shaped_row):
     alpha._quiet(head_shaped_row)
 
 
-def test_quiet_really_stops_live_timers(qapp):
+def test_quiet_really_stops_live_timers(qapp, style_restored):
     row = theme_picker.CustomThemeRow()
     timers = {}
     for name in ("_preview_timer", "_commit_timer"):
@@ -74,7 +90,7 @@ def test_hardcoded_timer_names_are_the_actual_bug(head_shaped_row):
         hardcoded(head_shaped_row)
 
 
-def test_slider_move_does_not_write_config(qapp, monkeypatch):
+def test_slider_move_does_not_write_config(qapp, style_restored, monkeypatch):
     writes = []
     monkeypatch.setattr(theme_picker, "save_wallpaper",
                         lambda *a, **k: writes.append(a))
@@ -91,4 +107,8 @@ def test_slider_move_does_not_write_config(qapp, monkeypatch):
         row._panel.setValue(value)
     alpha._quiet(row)
 
+    # 实测：只有 setValue 会把全局改成壁纸态（建 widget 和勾开关都不会），
+    # 所以这条判据既是在验"不落盘"，也是在验 fixture 的还原确实有东西要还原。
+    assert styles._wallpaper is not None and styles.current_theme == "custom", \
+        "预览链路没真的改过全局样式，这条判据和 style_restored 都是空转"
     assert not writes, f"滑杆改动直接落盘了 {len(writes)} 次：{writes}"
