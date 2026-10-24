@@ -18,6 +18,14 @@ from lmloader.gui import styles, theme_picker, ui_config
 OUT = dc.OUT / "alpha_sweep"
 
 
+def _quiet(row) -> None:
+    """停掉滑杆行上排队的定时器；预览定时器只有加了 40ms 防抖的那版才有，按对象实际有的来停。"""
+    for name in ("_preview_timer", "_commit_timer"):
+        timer = getattr(row, name, None)
+        if timer is not None:
+            timer.stop()
+
+
 def main() -> None:
     # 落盘口子先堵死：预览链路本身不写，只有 commit 定时器会写
     theme_picker.save_wallpaper = lambda *a, **k: None
@@ -60,12 +68,10 @@ def main() -> None:
     dc.pump(app, 0.8)
 
     def step(value: int, name: str) -> None:
-        row._commit_timer.stop()
-        row._preview_timer.stop()
+        _quiet(row)
         row._panel.setValue(value)          # 触发真实的 valueChanged → preview
         dc.pump(app, 0.12)
-        row._commit_timer.stop()
-        row._preview_timer.stop()
+        _quiet(row)
         win.grab().save(str(OUT / name))
         print(f"  [frame] {name}  panel={row._panel.value()}% "
               f"readout={row._readouts[row._panel].text()}")
